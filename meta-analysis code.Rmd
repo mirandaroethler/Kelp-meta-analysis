@@ -1,0 +1,4213 @@
+---
+title: "Kelp meta-analysis code"
+author: "Miranda Roethler"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r include=FALSE}
+#r setup
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Kelp meta-analysis
+## Step 1: set up workspace: load files, libraries (`metafor`, `tidyverse`)
+For an overview of what `metafor` can do, see: `vignette("diagram")`; also see Viechbauer et al. 2010 and Koricheva et al. 2013
+```{r setup, include=FALSE, echo=FALSE}
+require("knitr")
+opts_knit$set(root.dir = "~/Documents/Github/Kelp-meta-analysis-project") #set working directory
+```
+```{r echo = FALSE}
+library(metafor) #load required packages
+library(tidyverse)
+library(writexl)
+
+data <- read.csv("Kelp dataset.csv") #load dataset
+```
+## Step 2: Data cleaning
+Before running the rest of the script, check to make sure the data is clean, then return here
+## Step 3: Reformat data to be in vertical columns instead of horizontal. 
+Rotate data so that instead of being in a horizontal format, control + treatment data get their own columns. 
+```{r}
+#re-casting data
+controls <- filter(data, Treatment == "Control") #separate control data from other data
+controls$Stressor <- NULL #delete rows that will be redundant when you recombine
+controls$Treatment <- NULL 
+controls$Comments <- NULL
+
+data2 <- filter(data, Treatment != "Control") #separate non-control data from control data
+
+#re-combine control data into the rest of the database
+data3 <- left_join(data2, controls, by = c('Study', 'Year', 'Family', 'Genus', 'Species', 'Location', 'Latitude', 'Longitude', 'Month', 'Specific.lifestage', 'Lifestage', 'Response_category', 'Sign_change', 'Duration_days', 'Response_variable', 'Units', 'Timepoint'), suffix = c(".t",".c")) #.t stands for treatment; .c stands for control
+```
+from now on, columns with `.t` stand for treatment, and columns with `.c` stand for control.
+## Step 4: Add in Ecoregions data
+Code to divide up the data by ecoregions, the same ecoregions used in the Krumhansl et al. 2016 paper and courtesy of their Github (https://github.com/kelpecosystems/global_kelp_time_series/blob/master/02_sas_and_r_data_derivation_scripts/addRegionalData.R).
+```{r}
+############################################################################################
+# 
+# Script to turn lat/long data into
+# marine ecoregions using Spalding's Marine Ecoregions
+# of the World (MEOW).
+#
+# To run, first acquire the appropriate GIS files from TNC
+# https://geospatial.tnc.org/datasets/903c3ae05b264c00a3b5e58a4561b7e6/about
+# and unzip them into
+# a directory (MEOW-TNC) - then go from there.
+#
+# getRegionalInfo returns Realms, Provinces, and Ecoregions
+# for a single lat/long. I'm sure this can be improved, as this is
+# my first attempt at doing anything GIS-y in R!
+#
+# - Jarrett Byrnes
+#
+# Last Updated 6/10/2014
+############################################################################################
+
+library(rgdal)
+library(raster) 
+library(plyr)
+# for shapefiles, first argument of the read/write/info functions is the
+# directory location, and the second is the file name without suffix
+# optionally report shapefile details
+ogrInfo("~/Documents/Github/Kelp-meta-analysis-project/Kelp project/MEOW-TNC", "meow_ecos")
+
+regions <- readOGR("~/Documents/Github/Kelp-meta-analysis-project/Kelp project/MEOW-TNC", "meow_ecos")
+
+#let's see the map
+#plot(regions, axes=TRUE, border="gray")
+
+getRegionalInfo  <- function(lat1, long1){
+
+
+  #first, extract the co-ordinates (x,y - i.e., Longitude, Latitude)
+  coords <- cbind(long1, lat1)
+
+  FB.sp <- SpatialPointsDataFrame(coords,data.frame(value = c(4)))
+
+  proj4string(FB.sp) <- CRS("+proj=longlat +datum=WGS84 +no_defs")
+
+#  plot(regions)
+#  plot(FB.sp, add=T)
+
+
+  dsdat <- over(regions, FB.sp, add=T, fn = mean) 
+
+  ret <- data.frame(ECOREGION = regions$ECOREGION[which(dsdat$value==4)],
+                    PROVINCE = regions$PROVINCE[which(dsdat$value==4)],
+    REALM = regions$REALM[which(dsdat$value==4)])
+
+  if(nrow(ret)==0) ret <- data.frame(ECOREGION = NA,
+                                      PROVINCE = NA,
+                                      REALM = NA)
+  return(ret)
+
+}
+
+# they take a while, as the raw data file is large...must be a better way
+
+#get the unique lat/long pairs - speeds things up 5x!
+uniqueLatLong <- ddply(data3, .(Latitude, Longitude), summarise, len = length(Latitude)) #gives a data frame with just 3 columns: latitude, longitude, and number of occurrences. each lat/long only listed once.
+allRegions <- lapply(1:nrow(uniqueLatLong), function(i) getRegionalInfo(uniqueLatLong$Latitude[i], uniqueLatLong$Longitude[i]))
+allRegions <- ldply(allRegions)
+allRegions <- cbind(uniqueLatLong, allRegions)
+
+data4 <- join(data3, allRegions) #this should have the regional data
+data4 <- subset(data4, select = -len) #remove len column
+
+#loading plyr above cancels out some functionality of dplyr, so we will unload this and re-load the tidyverse
+detach("package:plyr", unload=TRUE)
+library(tidyverse) 
+
+```
+## Step 5 (optional): Delete data from studies that collected at multiple timepoints
+Take this step unless looking at experimental duration as a variable. 
+In the data file, for studies that took measurements at multiple timepoints, I have added the column "Timepoint" where "F" means that value was taken at the end of the experiment ("final value") and "NF" means that the value was not taken at the end of the experiment ("not final value"). 
+Here we will filter out all rows with "NF" values. 
+```{r}
+#NF timepoint
+data5 <- filter(data4, Timepoint == "F")
+```
+OR:
+```{r}
+data5 <- data4
+```
+## Step 6 (optional): Delete 'redundant' metrics (i.e. if a study included multiple ways to measure growth, e.g. change in weight AND change in length, just include one)
+```{r}
+#delete redundant metrics
+#make a list of all of the categories
+category_list <- unique(data5$Response_category)
+#take out biochemical composition because that one is going to be manually organized 
+category_list <- category_list[category_list != "Biochemical composition"]
+#create an empty list to store each category's response in
+filteredlist <- vector(mode = "list", length = length(category_list) + 1)
+
+for (x in 1:length(category_list)) {
+  
+  growth <- filter(data5, Response_category == category_list[x]) #filter out only growth category
+  growthlist <- growth %>% #make a list of all the variables this contains
+    count(Response_variable) %>%
+    arrange(desc(n)) #arrange in order from most to least entries
+  
+  growthcount <- growth %>% #record the number of ways used to measure growth within each study
+    count(Study, Lifestage, Response_variable) %>%
+    arrange(Study) %>%
+    count(Study, Lifestage)
+  
+  growthstudy <- growth %>% 
+    group_split(Study, Lifestage)
+  
+  output <- vector(mode = "list", length = length(growthstudy))
+  
+  for ( i in 1:nrow(growthcount)) {
+    
+    if (growthcount[i,2] > 1) {
+      respvar <- unique(growthstudy[[i]]$Response_variable) %>%   
+        str_c(collapse = "|") #create a character string with all of the response variables for that specific study
+      
+      finalvar <- str_extract(growthlist[,1], respvar) %>%
+        na.omit() #figure out the order of those variables from the reference list, i.e. who appears most often in the whole dataset
+      
+      output[[i]] <- filter(growthstudy[[i]], Response_variable == finalvar[1])
+      
+      }
+    
+    else {
+      output[[i]] <- growthstudy[[i]]
+    
+      }
+    }
+  filteredlist[[x]] <- bind_rows(output)
+}
+
+#Now do biochemical composition
+y <- length(category_list) + 1 #this is the position Biochemical Composition should be in
+biochem <- filter(data5, Response_category == "Biochemical composition") #filter out only biohcemical composition category
+biochemlist <- biochem %>% #make a list of all the variables this contains
+  count(Response_variable) %>%
+  arrange(desc(n)) %>% #arrange in order from most to least entries
+  subset(Response_variable != "C:N ratio")   #take out C:N ratio
+CN <- c("C:N ratio", "NA")
+biochemlist <- rbind(CN, biochemlist)#add in C:N ratio to the top
+  
+biochemcount <- biochem %>% #record the number of ways used to measure growth within each study
+    count(Study, Lifestage, Response_variable) %>%
+    arrange(Study) %>%
+    count(Study, Lifestage)
+  
+biochemstudy <- biochem %>% 
+    group_split(Study, Lifestage)
+  
+output <- vector(mode = "list", length = length(biochemstudy))
+  
+for ( i in 1:nrow(biochemcount)) {
+    
+    if (biochemcount[i,2] > 1) {
+      respvar <- unique(biochemstudy[[i]]$Response_variable) %>%   
+        str_c(collapse = "|") #create a character string with all of the response variables for that specific study
+      
+      finalvar <- str_extract(biochemlist[,1], respvar) %>%
+        na.omit() #figure out the order of those variables from the reference list, i.e. who appears most often in the whole dataset
+      
+      output[[i]] <- filter(biochemstudy[[i]], Response_variable == finalvar[1])
+      
+      }
+    
+    else {
+      output[[i]] <- biochemstudy[[i]]
+    
+      }
+    }
+filteredlist[[y]] <- bind_rows(output)
+
+#at the very end:
+
+data6 <- bind_rows(filteredlist)
+
+
+```
+## Step 7: (optional) Sign Change
+```{r}
+#step 1: filter out rows with (-) sign change
+negsign <- filter(data6, Sign_change == "-")
+possign <- filter(data6, Sign_change != "-")
+
+#step 2: re-name column headers in (-) sign change data frame
+#to essentially switch the '.c' and '.t' columns that have data in them
+names(negsign) <- c("Study", "Year", "Family", "Genus","Species", "Location", 
+                    "Latitude","Longitude", "Month", "Stressor", 
+                    "Specific.lifestage","Lifestage", "Response_category", 
+                    "Sign_change","Response_variable", "Units", 
+                    "Duration_days", "Timepoint","Treatment", 
+                    "Sample_size.c", #SWITCHED
+                    "pHT.t", "pCO2_uatm.t", "Temperature.t", 
+                    "Data.c",  "StDev.c", "StErr.c", "X95ci1.c", "X95ci2.c", #SWITCHED
+                    "Comments", 
+                    "Sample_size.t", #SWITCHED
+                    "pHT.c", "pCO2_uatm.c", "Temperature.c", 
+                    "Data.t", "StDev.t", "StErr.t", "X95ci1.t", "X95ci2.t", #SWITCHED
+                    "ECOREGION", "PROVINCE", "REALM") 
+
+#step 3: combine the two data frames again
+data7 <- full_join(possign, negsign)
+
+#test to make sure this step worked correctly: data6 and data7 should have the same number of rows
+nrow(data6) 
+nrow(data7)
+```
+## Step 8: Calculate Effect Size
+where:
+`n1i` and `n2i` are the sample sizes, of control and exp, respectively 
+`m1i` and `m2i` are the means, and 
+`sd1i` and `sd2i` are the standard deviations.
+To do this, we use the `escalc()` function. 
+```{r}
+#calculate effect size
+efsize <- escalc(measure = "SMD",
+               n1i = data7$Sample_size.c, #group sizes or row totals
+               n2i = data7$Sample_size.t, 
+               m1i = data7$Data.c, #means
+               m2i = data7$Data.t, 
+               sd1i = data7$StDev.c + 0.00001, #standard deviations, plus 0.0001 to eliminate 0's
+               sd2i = data7$StDev.t + 0.00001, 
+               add=0.001, to="if0all") #add a small value to 0's so they're not 0's anymore
+
+#add effect size calculations into the main dataset 
+data8 <- bind_cols(data7, efsize)
+```
+## Step 9: take out rows with NA's
+```{r}
+#effect size part 2
+#take out rows with NAs for effect size (i.e. effect size was unable to be calculated)
+data9 <- filter(data8, is.na(yi) == FALSE)
+```
+Can print out summary table with all of paper info in it
+```{r}
+
+manuscript_table <- data9 %>%
+  select('Study', 'Species', 'Location', 'Latitude', 'Longitude', 'Lifestage', 'Stressor', 'Response_category', 'Response_variable', 'REALM', 'PROVINCE', 'ECOREGION') %>%
+  distinct()
+
+write_xlsx(manuscript_table, "Table S1.xlsx")
+```
+## Step 10: Fit the results to a model
+First, make sure R is reading all of the columns like it should 
+```{r}
+#column type QAQC
+#make sure R is reading all of the factors as factors and not characters
+data9$Study <- as.factor(data9$Study)
+data9$Family <- as.factor(data9$Family)
+data9$Genus <- as.factor(data9$Genus)
+data9$Species <- as.factor(data9$Species)
+data9$Stressor <- as.factor(data9$Stressor)
+data9$Lifestage <- as.factor(data9$Lifestage)
+data9$Response_category <- as.factor(data9$Response_category)
+data9$pCO2_uatm.t <- as.numeric(data9$pCO2_uatm.t)
+data9$pCO2_uatm.c <- as.numeric(data9$pCO2_uatm.c)
+data9$Response_variable <- as.factor(data9$Response_variable)
+data9$ECOREGION <- as.factor(data9$ECOREGION)
+data9$PROVINCE <- as.factor(data9$PROVINCE)
+data9$REALM <- as.factor(data9$REALM)
+```
+Also create a column called "effect size ID" so that each entry in this database gets its own number (this will be important for modeling, see: https://bookdown.org/MathiasHarrer/Doing_Meta_Analysis_in_R/multilevel-ma.html)
+```{r}
+#create a column 'effect size ID'
+data9 <- data9 %>% 
+  mutate(es_id = paste("id",row_number()))
+
+```
+Add in columns for the change in pH/pCO2/temperature
+```{r}
+data9$deltapH <- data9$pHT.c - data9$pHT.t
+data9$deltapCO2 <- data9$pCO2_uatm.t - data9$pCO2_uatm.c
+data9$deltaT <- data9$Temperature.t - data9$Temperature.c
+```
+**Run the actual model**
+deltapH and deltaT as variables
+```{r}
+#pCO2
+my.rma.pH <- rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                  ~ 1 | Species,
+                                  ~ 1 | Duration_days),
+                    mods = ~ deltapH, 
+                    subset = ((Stressor == "OA" | Stressor == "OA + T") 
+                              &  deltapH != "NA" &
+                                 Duration_days != "NA"),
+                    method = "REML",
+                    control=list(optimizer="optim", optmethod="Nelder-Mead"), 
+                    sparse = TRUE, #this should speed up model fitting
+                    verbose = TRUE #this will display model progress
+                     )
+my.rma.pH 
+
+#pCO2
+my.rma.pCO2 <- rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                  ~ 1 | Species,
+                                  ~ 1 | Duration_days),
+                    mods = ~ deltapCO2, 
+                    subset = ((Stressor == "OA" | Stressor == "OA + T") 
+                              &  deltapCO2 != "NA" &
+                                 Duration_days != "NA"),
+                    method = "REML",
+                    control=list(optimizer="optim", optmethod="Nelder-Mead"), 
+                    sparse = TRUE, #this should speed up model fitting
+                    verbose = TRUE #this will display model progress
+                     )
+summary(my.rma.pCO2) #significant, but estimate is almost 0.
+
+
+my.rma.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                  ~ 1 | Species,
+                                  ~ 1 | Duration_days),
+                    mods = ~ deltaT, 
+                    subset = ((Stressor == "T" | Stressor == "OA + T") 
+                              &  deltaT != "NA" &
+                                 Duration_days != "NA"),
+                    method = "REML",
+                    control=list(optimizer="optim", optmethod="Nelder-Mead"), 
+                    sparse = TRUE, #this should speed up model fitting
+                    verbose = TRUE #this will display model progress
+                     )
+summary(my.rma.t) #significant
+
+
+
+#plot it
+#pH
+jpeg("~/Documents/Github/Kelp-meta-analysis-project/Figures/pH_regression.jpg")
+regplot(my.rma.pH, mod="deltapH", xlab="Decrease in pH", 
+        ylim = c(-10, 10), 
+        refline = 0)
+dev.off()
+
+#pCO2
+jpeg("~/Documents/Github/Kelp-meta-analysis-project/Figures/pCO2_regression.jpg")
+regplot(my.rma.pCO2, mod="deltapCO2", xlab="Increase in pCO2 (uatm)", 
+        ylim = c(-10, 10), 
+        refline = 0)
+dev.off()
+
+#temperature
+jpeg("~/Documents/Github/Kelp-meta-analysis-project/Figures/temp_regression.jpg")
+regplot(my.rma.t, mod="deltaT", xlab="Increase in temperature (deg C)", 
+        ylim = c(-10, 20), 
+        refline = 0)
+dev.off()
+
+```
+Duration as a variable
+```{r}
+#go back to the original dataset before you cut out NF data
+#run this line, then go back and run code steps 6 - 8 again.
+data5 <- data3
+
+#then, run the following code.
+rma.dur.oa <-  rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                  ~ 1 | Species,
+                                  ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 deltapCO2 != "NA" & 
+                                 Duration_days != "NA"),
+                    mods = ~ Duration_days, 
+                    method = "REML",
+                    control=list(optimizer="optim", 
+                                 optmethod="Nelder-Mead"), 
+                    sparse = TRUE, #this should speed up model fitting
+                    verbose = TRUE #this will display model progress
+                     )
+summary(rma.dur.oa) 
+
+#OAT
+rma.dur.oat <-  rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                  #~ 1 | Species),
+                                  ~ 1 | deltapCO2,
+                                  ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T" & 
+                                 deltapCO2 != "NA" &
+                                 deltaT != "NA" &
+                                 Duration_days != "NA"),
+                    mods = ~ Duration_days, 
+                    method = "REML",
+                    control=list(optimizer="optim", 
+                                 optmethod="Nelder-Mead"), 
+                    sparse = TRUE, #this should speed up model fitting
+                    verbose = TRUE #this will display model progress
+                     )
+summary(rma.dur.oat)
+
+
+#T
+rma.dur.t <-  rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                  ~ 1 | Species,
+                                  ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 deltaT != "NA" &
+                                 Duration_days != "NA"),
+                    mods = ~ Duration_days, 
+                    method = "REML",
+                    control=list(optimizer="optim", 
+                                 optmethod="Nelder-Mead"), 
+                    sparse = TRUE, #this should speed up model fitting
+                    verbose = TRUE #this will display model progress
+                     )
+summary(rma.dur.t)
+
+
+#plot it
+regplot(rma.dur.t, mod="Duration_days", xlab="Experiment duration (days)", 
+        ylim = c(-10, 20),
+        refline = 0)
+
+regplot(rma.dur.oa, mod="Duration_days", xlab="Experiment duration (days)", 
+        ylim = c(-10, 20),
+        refline = 0)
+
+regplot(rma.dur.oat, mod="Duration_days", xlab="Experiment duration (days)", 
+        ylim = c(-10, 20),
+        refline = 0)
+
+#try this bubble plot code : https://constantinyvesplessen.com/post/workshop_meta_analysis/
+temp <- filter(data9, Stressor == "T")
+oa <- filter(data9, Stressor == "OA")
+both <- filter(data9, Stressor == "OA + T")
+bubble_mod <- ggplot(both, 
+                     aes(Duration_days, yi,   # 
+                     size = 1 / sqrt(vi))) + # size of bubbles in increased by 1/sqrt
+  geom_point(shape = 1) +                    # shape = 1 for hollow dots
+  geom_smooth(method = lm,                   # add regression line 
+              color = "grey", 
+              se=T,                          # display confidence intervall
+              size = 0.5, 
+              alpha = .2) +  
+  geom_hline(yintercept = 0) +
+  ylim(-25, 25) +
+  ylab("Effect size") + # change y-axis name
+  xlab("Experiment duration (days)") +                 # change x-axis name
+  theme_classic() +                          # use theme for aesthetic reasons
+  scale_size_continuous(guide = "none")      # removes legend for different point-sizes
+  
+bubble_mod
+
+```
+Stressor alone
+```{r}
+#STRESSOR ALONE
+rma.str <- rma.mv(yi = yi, V = vi, data = data9, 
+                  subset = (Duration_days != "NA"), 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days),
+                     mods = ~ Stressor - 1, 
+                     method = "REML",
+                     control=list(optimizer="optim", optmethod="Nelder-Mead"), 
+                     sparse = TRUE, #this should speed up model fitting
+                     verbose = TRUE #this will display model progress
+                     )
+summary(rma.str)
+
+
+#include all durations
+rma.str.dur <- rma.mv(yi = yi, V = vi, data = data9, 
+                  subset = (Duration_days != "NA"), 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days),
+                     mods = ~ Stressor - 1, 
+                     method = "REML",
+                     control=list(optimizer="optim", optmethod="Nelder-Mead"),
+                     sparse = TRUE, #this should speed up model fitting
+                     verbose = TRUE #this will display model progress
+                     )
+summary(rma.str.dur)
+
+#create a data frame of the data
+graphdata.str <- data.frame(
+  stressor = c("OA", "OA + T", "T"), 
+  mean = rma.str.dur$b[,1] * -1,
+  ci.lb = rma.str.dur$ci.lb * -1,
+  ci.ub = rma.str.dur$ci.ub * -1, 
+  Padj = rma.str.dur$pval)
+
+#set point size equal to number of rows of data
+pointsize <- data9 %>%
+  count(Stressor)
+#add point size as a variable to the graphing data frame
+graphdata.str <- bind_cols(graphdata.str, pointsize = pointsize$n) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata.str$col <- if_else(graphdata.str$Padj > 0.05, 'grey',
+                      if_else(graphdata.str$ci.ub < 0, 'red', 'blue'))
+
+ggplot(data = graphdata.str, 
+       aes(x = stressor, y = mean, ymax = ci.ub, ymin = ci.lb, #label = ifelse(Padj < 0.05, "*", "")
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("No effect", "Negative")) +
+  #geom_text(vjust = -0.4, hjust = -0.4, size = 6) +
+  coord_flip() + 
+  scale_x_discrete(limits = c("OA", "OA + T", "T"), labels = trmt.labs) +
+  scale_size_continuous(range = c(0.2, 1.7),
+                        name = "Number of\ndata points") +
+  xlab("Stressor") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines"))
+#insert n= on the side
+
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "stressors.jpg",
+       width = 15, height = 8, units = "cm")
+```
+Funnel plots
+```{r}
+###### publication bias ###########
+data10 <- filter(data9, Timepoint != "NF")
+#funnel plot for all OA metrics to test for publication bias
+rma_oa <-rma(yi,vi, method="REML", data=subset(data10, Stressor == 'OA'))
+funnel(rma_oa, pch = 20) 
+#test for funnel asymmetry
+regtest(rma_oa, model = "lm") 
+
+#funnel plot for all T metrics to test for publication bias
+rma_t <-rma(yi,vi, method="REML", data=subset(data10, Stressor == 'T'))
+funnel(rma_t, pch = 20) 
+#test for funnel asymmetry
+regtest(rma_t, model = "lm") 
+
+#funnel plot for all OA + T metrics to test for publication bias
+rma_oat <-rma(yi,vi, method="REML", data=subset(data10, Stressor == 'OA + T'))
+funnel(rma_oat, pch = 20) 
+#test for funnel asymmetry
+regtest(rma_oat, model = "lm") 
+```
+Stressor x life stage
+```{r}
+data10 <- filter(data9, Timepoint == "F")
+my.rma.life.oa <- rma.mv(yi = yi, V = vi, data = data10, 
+                     random = list(~ 1 | Study,
+                                   #~ 1 | Duration_days,
+                                   ~ 1 | Species,
+                                   ~ 1 | deltapCO2
+                                   ),
+                     subset = (Stressor == "OA" & 
+                                 deltapCO2 != "NA" ),#& 
+                                 #Duration_days != "NA"),
+                     mods = ~ Lifestage - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = TRUE, #this will update you on the status on the model
+                     sparse = TRUE) #this will supposedly speed up model running
+
+summary(my.rma.life.oa)
+
+my.rma.life.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                  #~ 1 | Species,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T"  
+                                 & deltaT != "NA"  
+                                 & deltapCO2 != "NA" 
+                                 & Duration_days != "NA"),
+                     mods = ~ Lifestage - 1,
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = TRUE, #this will update you on the status on the model
+                     sparse = TRUE) #this will supposedly speed up model running -- see pp. 231 of R documentation
+
+summary(my.rma.life.oat)
+
+
+my.rma.life.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | Species,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 deltaT != "NA" &
+                                 Duration_days != "NA" ),
+                     mods = ~ Lifestage - 1,
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+
+summary(my.rma.life.t)
+
+
+#turn model output into a dataframe and convert back to % change instead of a log value
+#make a list of the life stages
+lifestage_list <- unique(data9$Lifestage)
+stressor_list <- unique(data9$Stressor)
+
+graphdata.life.oa <- data.frame(
+  Stressor = rep("OA", times = 4),
+  Lifestage = sort(lifestage_list), 
+  mean = my.rma.life.oa$b[, 1] * -1, 
+  ci.lb = my.rma.life.oa$ci.lb * -1,
+  ci.ub = my.rma.life.oa$ci.ub * -1,
+  Padj = my.rma.life.oa$pval)
+
+graphdata.life.oat <- data.frame(
+  Stressor = rep("OA + T", times = 4),
+  Lifestage = sort(lifestage_list), 
+  mean = my.rma.life.oat$b[, 1]  * -1, 
+  ci.lb = my.rma.life.oat$ci.lb * -1,
+  ci.ub = my.rma.life.oat$ci.ub * -1,
+  Padj = my.rma.life.oat$pval)
+
+graphdata.life.t <- data.frame(
+  Stressor = rep("T", times = 4),
+  Lifestage = sort(lifestage_list), 
+  mean = my.rma.life.t$b[, 1] * -1, 
+  ci.lb = my.rma.life.t$ci.lb * -1,
+  ci.ub = my.rma.life.t$ci.ub * -1,
+  Padj = my.rma.life.t$pval)
+
+#combine into one
+graphdata.life <- bind_rows(graphdata.life.oa, graphdata.life.oat, graphdata.life.t) %>%
+  mutate(Stressor = fct_relevel(Stressor, "T", "OA + T", "OA"))
+
+pointsize <- data9 %>%
+  count(Stressor, Lifestage)
+
+graphdata <- cbind(graphdata.life, pointsize = pointsize$n)
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+lifegraph <- ggplot(data = graphdata, 
+       aes(x = Lifestage, y = mean, ymax = ci.ub, ymin = ci.lb,
+        #label = ifelse(Padj < 0.05, "*", "")
+        color = col)) +
+   geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('dodgerblue2','gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("Positive","No effect", "Negative")) +
+  #geom_text(vjust = 0, hjust = -0.4, size = 6) +
+  scale_x_discrete(limits=c("Adult sporophyte", "Young sporophyte", "Gametophyte", "Spore/germling")) +
+  coord_flip() + 
+  scale_size_continuous(range = c(0.2, 1.9), name = "Number of\ndata points",
+                        breaks = c(250, 500, 750, 1000)) +
+  facet_grid(~ Stressor, labeller = labeller(Stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_y_continuous(breaks = seq(-2, 2, 1)) +
+  xlab("Life stage") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines"))  
+lifegraph
+
+
+```
+Stressor x response category
+```{r}
+# RESPONSE CATEGORY BY STRESSOR
+my.rma.resp.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                  # ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" 
+                                & Duration_days != "NA" 
+                                 & deltapCO2 != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, 
+                     sparse = TRUE) 
+summary(my.rma.resp.oa)
+
+my.rma.resp.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   #~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA + T" &
+                                 Duration_days != "NA" &
+                                 deltaT != "NA" & 
+                                 deltapCO2 != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.resp.oat)
+
+my.rma.resp.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" &
+                                 Duration_days != "NA" &
+                                 deltaT != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.resp.t)
+
+#turn model output into a dataframe and convert back to % change instead of a log value
+oalist <- data9 %>%
+  subset(Stressor == "OA", select = Response_category) %>%
+  unique() 
+oalist <- sort(oalist$Response_category)
+
+graphdata.oa <- data.frame(
+  Stressor = rep("OA", times = length(oalist)),
+  variable = oalist, 
+  mean = my.rma.resp.oa$b[, 1] * -1, 
+  ci.lb = my.rma.resp.oa$ci.lb * -1,
+  ci.ub = my.rma.resp.oa$ci.ub * -1,
+  Padj = my.rma.resp.oa$pval,
+  zscore = my.rma.resp.oa$zval)
+
+oatlist <- data9 %>%
+  subset(Stressor == "OA + T", select = Response_category) %>%
+  unique() 
+oatlist <- sort(oatlist$Response_category)
+
+graphdata.oat <- data.frame(
+  Stressor = rep("OA + T", times = length(oatlist)),
+  variable = oatlist,
+  mean = my.rma.resp.oat$b[, 1] * -1, 
+  ci.lb = my.rma.resp.oat$ci.lb * -1,
+  ci.ub = my.rma.resp.oat$ci.ub * -1,
+  Padj = my.rma.resp.oat$pval,
+  zscore = my.rma.resp.oat$zval)
+
+tlist <- data9 %>%
+  subset(Stressor == "T", select = Response_category) %>%
+  unique() 
+tlist <- sort(tlist$Response_category)
+
+graphdata.t <- data.frame(
+  Stressor = rep("T", times = length(tlist)),
+  variable = tlist,
+  mean = my.rma.resp.t$b[, 1] * -1,
+  ci.lb = my.rma.resp.t$ci.lb * -1, 
+  ci.ub = my.rma.resp.t$ci.ub * -1,
+  Padj = my.rma.resp.t$pval,
+  zscore = my.rma.resp.t$zval
+    )
+
+
+#combine into one
+graphdata <- bind_rows(graphdata.oa, graphdata.oat, graphdata.t) %>%
+  mutate(Stressor = fct_relevel(Stressor, "T", "OA + T", "OA"))
+
+#this defines the elements to go in the plot, both the x and y and upper and lower CIs
+pointsize <- data9 %>%
+  count(Stressor, Response_category)
+
+graphdata <- cbind(graphdata, pointsize = pointsize$n)
+  
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+#graph it
+ggplot(data = graphdata, 
+       aes(x = variable, y = mean, ymax = ci.ub, ymin = ci.lb, #label = ifelse(Padj < 0.05, "*", "")
+        color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('dodgerblue2','gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("Positive","No effect", "Negative")) +
+  #geom_text(vjust = -0.05, hjust = -1, size = 5) +
+  scale_x_discrete(limits = c("Survival", "Tissue health", "Reproduction & Development",
+                              "Growth", "Biochemical composition", "Pigments", 
+                              "Respiration", "Net primary productivity", "Fluorescence", 
+                              "Enzyme activity", "Stress response"),
+                   labels = c("Survival", "Tissue health", "Reproduction",
+                              "Growth", "Biochemical composition", "Pigments", 
+                              "Respiration", "Net primary productivity", "Fluorescence", 
+                              "Enzyme activity", "Stress response")) +
+  coord_flip() + 
+  scale_size_continuous(range = c(0.2, 1.9), 
+                        name = "Number of\ndata points") +
+  facet_grid( ~ Stressor, labeller = labeller(Stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_y_continuous(breaks = seq(-3, 3, 1)) +
+  xlab("Metric") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines")) 
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "response_category.jpg",
+       width = 25, height = 10, units = "cm"
+       )
+
+
+```
+Stressor x lifestage x response category
+```{r}
+my.rma.oa.as <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species, 
+                                   ~ 1 | deltapCO2
+                                   ),
+                     subset = (Stressor == "OA" & Lifestage == "Adult sporophyte" 
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"
+                               ),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oa.as)
+
+my.rma.oa.g <- rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species, 
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & Lifestage == "Gametophyte"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oa.g)
+
+my.rma.oa.sg <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species, 
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & Lifestage == "Spore/germling"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oa.sg)
+
+my.rma.oa.ys <- rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species), 
+                                   #~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & Lifestage == "Young sporophyte"
+                              & Duration_days != "NA"),
+                               #& deltapCO2 != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oa.ys)
+
+my.rma.t.as <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species, 
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & Lifestage == "Adult sporophyte"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.t.as)
+
+my.rma.t.g <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species, 
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & Lifestage == "Gametophyte"
+                                & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.t.g)
+
+my.rma.t.sg <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species, 
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & Lifestage == "Spore/germling"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.t.sg)
+
+my.rma.t.ys <- rma.mv(yi = yi, V = vi, data = data9, 
+                      random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species, 
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & Lifestage == "Young sporophyte"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.t.ys)
+
+my.rma.oat.as <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species, 
+                                   ~ 1 | deltaT,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA + T" & 
+                               Lifestage == "Adult sporophyte" 
+                               & Duration_days != "NA"
+                               & deltaT != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oat.as)
+
+my.rma.oat.g <- rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species#, 
+                                   #~ 1 | deltaT,
+                                   #~ 1 | deltapCO2
+                                  ),
+                     subset = (Stressor == "OA + T" & Lifestage == "Gametophyte"
+                               & Duration_days != "NA"
+                               #& deltaT != "NA"
+                               #& deltapCO2 != "NA"
+                               ),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oat.g)
+
+my.rma.oat.sg <- rma.mv(yi = yi, V = vi, data = data10, 
+                    random = list(~ 1 | Study,
+                                  # ~ 1 | Duration_days, 
+                                  # ~ 1 | Species, 
+                                   ~ 1 | deltaT,
+                                   ~ 1 | deltapCO2
+                                  ),
+                     subset = (Stressor == "OA + T" & 
+                               Lifestage == "Spore/germling"
+                               #& Duration_days != "NA"
+                               & deltaT != "NA"
+                               & deltapCO2 != "NA"
+                               ),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oat.sg)
+
+my.rma.oat.ys <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days, 
+                                   ~ 1 | Species, 
+                                   ~ 1 | deltaT,
+                                   ~ 1 | deltapCO2 
+                                   ),
+                     subset = (Stressor == "OA + T" & 
+                               Lifestage == "Young sporophyte"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"
+                               & deltapCO2 != "NA"
+                              ),
+                     mods = ~ Response_category - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oat.ys)
+
+
+#set up model results to be graphed
+oaadultlist <- data9 %>%
+  subset(Stressor == "OA" & Lifestage == "Adult sporophyte", 
+         select = Response_category) %>%
+  unique() 
+oaadultlist <- sort(oaadultlist$Response_category)
+
+graphdata.oa.as <- data.frame(
+  Stressor = rep("OA", times = length(oaadultlist)),
+  Lifestage = rep("Adult sporophyte", times = length(oaadultlist)),
+  variable = oaadultlist,
+  mean = my.rma.oa.as$b[, 1] * -1, 
+  ci.lb = my.rma.oa.as$ci.lb * -1, 
+  ci.ub = my.rma.oa.as$ci.ub * -1, 
+  Padj = my.rma.oa.as$pval)
+
+
+oagamlist <- data9 %>%
+  subset(Stressor == "OA" & Lifestage == "Gametophyte" & deltapCO2 != "NA",
+         select = Response_category) %>%
+  unique() 
+oagamlist <- sort(oagamlist$Response_category)
+
+graphdata.oa.g <- data.frame(
+  Stressor = rep("OA", times = length(oagamlist)),
+  Lifestage = rep("Gametophyte", times = length(oagamlist)),
+  variable = oagamlist,
+  mean = my.rma.oa.g$b[, 1] * -1,
+  ci.lb = my.rma.oa.g$ci.lb * -1, 
+  ci.ub = my.rma.oa.g$ci.ub * -1, 
+  Padj = my.rma.oa.g$pval)
+
+
+oasporelist <- data9 %>%
+  subset(Stressor == "OA" & Lifestage == "Spore/germling", 
+         select = Response_category) %>%
+  unique() 
+oasporelist <- sort(oasporelist$Response_category)
+
+graphdata.oa.sg <- data.frame(
+  Stressor = rep("OA", times = length(oasporelist)),
+  Lifestage = rep("Spore/germling", times = length(oasporelist)),
+  variable = oasporelist, 
+  mean = my.rma.oa.sg$b[, 1] * -1, 
+  ci.lb = my.rma.oa.sg$ci.lb * -1, 
+  ci.ub = my.rma.oa.sg$ci.ub * -1, 
+  Padj = my.rma.oa.sg$pval)
+
+
+oayounglist <- data9 %>%
+  subset(Stressor == "OA" & Lifestage == "Young sporophyte", 
+         select = Response_category) %>%
+  unique() 
+oayounglist <- sort(oayounglist$Response_category)
+
+graphdata.oa.ys <- data.frame(
+  Stressor = rep("OA", times = length(oayounglist)),
+  Lifestage = rep("Young sporophyte", times = length(oayounglist)),
+  variable = oayounglist,
+  mean = my.rma.oa.ys$b[, 1] * -1, 
+  ci.lb = my.rma.oa.ys$ci.lb * -1, 
+  ci.ub = my.rma.oa.ys$ci.ub * -1, 
+  Padj = my.rma.oa.ys$pval)
+
+
+tadultlist <- data9 %>%
+  subset(Stressor == "T" & Lifestage == "Adult sporophyte", 
+         select = Response_category) %>%
+  unique() 
+tadultlist <- sort(tadultlist$Response_category)
+
+graphdata.t.as <- data.frame( 
+  Stressor = rep("T", times = length(tadultlist)),
+  Lifestage = rep("Adult sporophyte", times = length(tadultlist)),
+  variable = tadultlist,
+  mean = my.rma.t.as$b[, 1] * -1, 
+  ci.lb = my.rma.t.as$ci.lb * -1, 
+  ci.ub = my.rma.t.as$ci.ub * -1, 
+  Padj = my.rma.t.as$pval)
+
+
+tgamlist <- data9 %>%
+  subset(Stressor == "T" & Lifestage == "Gametophyte", 
+         select = Response_category) %>%
+  unique() 
+tgamlist <- sort(tgamlist$Response_category)
+
+graphdata.t.g <- data.frame( 
+  Stressor = rep("T", times = length(tgamlist)),
+  Lifestage = rep("Gametophyte", times = length(tgamlist)),
+  variable = tgamlist, 
+  mean = my.rma.t.g$b[, 1] * -1, 
+  ci.lb = my.rma.t.g$ci.lb * -1,
+  ci.ub = my.rma.t.g$ci.ub * -1,
+  Padj = my.rma.t.g$pval)
+
+
+tsporelist <- data9 %>%
+  subset(Stressor == "T" & Lifestage == "Spore/germling", 
+         select = Response_category) %>%
+  unique() 
+tsporelist <- sort(tsporelist$Response_category)
+
+graphdata.t.sg <- data.frame(
+  Stressor = rep("T", times = length(tsporelist)),
+  Lifestage = rep("Spore/germling", times = length(tsporelist)),
+  variable = tsporelist, 
+  mean = my.rma.t.sg$b[, 1] * -1, 
+  ci.lb = my.rma.t.sg$ci.lb * -1, 
+  ci.ub = my.rma.t.sg$ci.ub * -1, 
+  Padj = my.rma.t.sg$pval)
+
+
+tyounglist <- data9 %>%
+  subset(Stressor == "T" & Lifestage == "Young sporophyte", 
+         select = Response_category) %>%
+  unique() 
+tyounglist <- sort(tyounglist$Response_category)
+
+graphdata.t.ys <- data.frame(
+  Stressor = rep("T", times = length(tyounglist)),
+  Lifestage = rep("Young sporophyte", times = length(tyounglist)),
+  variable = tyounglist, 
+  mean = my.rma.t.ys$b[, 1] * -1, 
+  ci.lb = my.rma.t.ys$ci.lb * -1,
+  ci.ub = my.rma.t.ys$ci.ub * -1, 
+  Padj = my.rma.t.ys$pval)
+
+
+oatadultlist <- data9 %>%
+  subset(Stressor == "OA + T" & Lifestage == "Adult sporophyte", 
+         select = Response_category) %>%
+  unique() 
+oatadultlist <- sort(oatadultlist$Response_category)
+
+graphdata.oat.as <- data.frame(
+  Stressor = rep("OA + T", times = length(oatadultlist)),
+  Lifestage = rep("Adult sporophyte", times = length(oatadultlist)),
+  variable = oatadultlist, 
+  mean = my.rma.oat.as$b[, 1] * -1, 
+  ci.lb = my.rma.oat.as$ci.lb * -1, 
+  ci.ub = my.rma.oat.as$ci.ub * -1,
+  Padj = my.rma.oat.as$pval)
+
+
+oatgamlist <- data9 %>%
+  subset(Stressor == "OA + T" & Lifestage == "Gametophyte", 
+         select = Response_category) %>%
+  unique() 
+oatgamlist <- sort(oatgamlist$Response_category)
+
+graphdata.oat.g <- data.frame(
+  Stressor = rep("OA + T", times = length(oatgamlist)),
+  Lifestage = rep("Gametophyte", times = length(oatgamlist)),
+  variable = oatgamlist, 
+  mean = my.rma.oat.g$b[, 1] * -1, 
+  ci.lb = my.rma.oat.g$ci.lb * -1, 
+  ci.ub = my.rma.oat.g$ci.ub * -1, 
+  Padj = my.rma.oat.g$pval)
+
+
+oatsporelist <- data9 %>%
+  subset(Stressor == "OA + T" & Lifestage == "Spore/germling", 
+         select = Response_category) %>%
+  unique() 
+oatsporelist <- sort(oatsporelist$Response_category)
+  
+graphdata.oat.sg <- data.frame(
+  Stressor = rep("OA + T", times = length(oatsporelist)),
+  Lifestage = rep("Spore/germling", times = length(oatsporelist)),
+  variable = oatsporelist, 
+  mean = my.rma.oat.sg$b[, 1] * -1,
+  ci.lb = my.rma.oat.sg$ci.lb * -1, 
+  ci.ub = my.rma.oat.sg$ci.ub * -1,
+  Padj = my.rma.oat.sg$pval)
+
+
+oatyounglist <- data9 %>%
+  subset(Stressor == "OA + T" & Lifestage == "Young sporophyte", 
+         select = Response_category) %>%
+  unique() 
+oatyounglist <- sort(oatyounglist$Response_category)
+
+graphdata.oat.ys <- data.frame(
+  Stressor = rep("OA + T", times = length(oatyounglist)),
+  Lifestage = rep("Young sporophyte", times = length(oatyounglist)),
+  variable = oatyounglist, 
+  mean = my.rma.oat.ys$b[, 1] * -1, 
+  ci.lb = my.rma.oat.ys$ci.lb * -1, 
+  ci.ub = my.rma.oat.ys$ci.ub * -1,
+  Padj = my.rma.oat.ys$pval)
+
+
+#combine into one
+graphdata <- bind_rows(graphdata.oa.as, graphdata.oa.g, graphdata.oa.sg, 
+                       graphdata.oa.ys, graphdata.oat.as, graphdata.oat.g, 
+                       graphdata.oat.sg, graphdata.oat.ys, graphdata.t.as, 
+                       graphdata.t.g, graphdata.t.sg, graphdata.t.ys)
+
+#define point size
+pointsize <- data9 %>%
+  count(Stressor, Lifestage, Response_category)
+pointsize$variable <- pointsize$Response_category
+
+graphdata <- left_join(graphdata, pointsize, 
+                       by = c("Stressor", "Lifestage", "variable"))  %>%
+  mutate(Stressor = fct_relevel(Stressor, "T", "OA + T", "OA"))
+graphdata$pointsize <- graphdata$n
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+#this defines the elements to go in the plot, both the x and y and upper and lower CIs
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+category.order <- rev(c("Stress response", "Enzyme activity", "Fluorescence", 
+                    "Net primary productivity", "Respiration", "Pigments", 
+                    "Biochemical composition", "Growth", 
+                    "Reproduction & Development", "Tissue health", 
+                    "Survival"))
+
+ggplot(data = graphdata, 
+       aes(x = factor(variable, level = category.order), 
+           y = mean, ymax = ci.ub, ymin = ci.lb,
+        color = col)) +
+   geom_hline(aes(yintercept = 0), lty = 3, size = 1, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('dodgerblue2','gray30', 'firebrick2'),
+                     name = "Effect direction",
+                     labels = c("Positive", "No effect", "Negative")) +
+   scale_size_continuous(range = c(0.1, 1),
+                         name = "Number of\ndata points") +
+  scale_x_discrete(labels = c("Survival", "Tissue health", "Reproduction",
+                              "Growth", "Biochemical composition", "Pigments", 
+                              "Respiration", "Net primary productivity", "Fluorescence", 
+                              "Enzyme activity", "Stress response")) +
+  coord_flip() + 
+  facet_grid(factor(Lifestage, levels=c('Spore/germling','Gametophyte',
+                                                   'Young sporophyte',
+                                        'Adult sporophyte')) 
+             ~ Stressor,
+             labeller = labeller(Stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_y_continuous(breaks = seq(-9, 6, 3)) +
+  xlab("Metric") + ylab("Effect size") +
+  theme_bw() +
+  theme(#legend.position = "none",
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.spacing.x = unit(1, "lines"),
+        panel.spacing.y = unit(1, "lines"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line()
+        ) 
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "response_category_lifestage.jpg",
+       width = 23, height = 20, units = "cm"
+       )
+
+
+```
+Stressor x Ecoregion
+```{r}
+ecoregion_list <-  unique(data9$ECOREGION)
+ecoregion_order <- c("South New Zealand", "Northeastern New Zealand", "Tweed-Moreton", "Bassian", "Western Bassian", "Leeuwin", "South Australian Gulfs", "Houtman", "Natal",  "Namaqua", "Chiloense", "Araucanian", "Central Chile", "Humboldtian", "Central Kuroshio Current", "Sea of Japan/East Sea", "East China Sea", "Yellow Sea", "Northeastern Honshu", "South European Atlantic Shelf", "Celtic Seas", "North Sea", "Southern Norway", "Northern Norway and Finnmark", "North and East Barents Sea", "Scotian Shelf", "Hudson Complex", "Gulf of Maine/Bay of Fundy", "Virginian", "Southern California Bight", "Northern California", "Puget Trough/Georgia Basin", "Oregon, Washington, Vancouver Coast and Shelf", "Gulf of Alaska")
+
+my.rma.oa.eco <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list( ~ 1 | Study,
+                                    ~ 1 | Species,
+                                    ~ 1 | Duration_days,
+                                    ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" 
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ ECOREGION - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oa.eco)
+
+my.rma.oat.eco <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list( ~ 1 | Study,
+                                    #~ 1 | Species,
+                                    ~ 1 | Duration_days,
+                                    ~ 1 | deltaT,
+                                    ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA + T"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"
+                               & deltapCO2 != "NA"
+                               ),
+                     mods = ~ ECOREGION - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oat.eco)
+
+my.rma.t.eco <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list( ~ 1 | Study,
+                                    ~ 1 | Species,
+                                    ~ 1 | Duration_days,
+                                    ~ 1 | deltaT),
+                     subset = (Stressor == "T"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ ECOREGION - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.t.eco)
+
+#turn model output into a dataframe and convert back to % change instead of a log value
+oaecolist <- data9 %>%
+  subset(Stressor == "OA" & deltapH != "NA", select = ECOREGION) %>%
+  unique() 
+oaecolist <- sort(oaecolist$ECOREGION)
+
+graphdata.ecoregion.oa <- data.frame(
+  Type = rep("Ecoregion", times = length(oaecolist)),
+  Stressor = rep("OA", times = length(oaecolist)),
+  ECOREGION = oaecolist,
+  mean = my.rma.oa.eco$b[, 1] * -1, 
+  ci.lb = my.rma.oa.eco$ci.lb * -1, 
+  ci.ub = my.rma.oa.eco$ci.ub * -1, 
+  Padj = my.rma.oa.eco$pval)
+
+#add in point size
+oa.pointsize.e <- data9 %>%
+  subset(Stressor == "OA") %>%
+ count(Stressor, REALM, PROVINCE, ECOREGION) 
+#combine data frames
+graphdata.ecoregion.oa <- full_join(graphdata.ecoregion.oa, oa.pointsize.e, 
+                                  by = c("ECOREGION","Stressor"))
+
+
+oatecolist <- data9 %>%
+  subset(Stressor == "OA + T" & deltapH != "NA", select = ECOREGION) %>%
+  unique() 
+oatecolist <- sort(oatecolist$ECOREGION)
+
+graphdata.ecoregion.oat <- data.frame(
+  Type = rep("Ecoregion", times = length(oatecolist)),
+  Stressor = rep("OA + T", times = length(oatecolist)),
+  ECOREGION = oatecolist,
+  mean = my.rma.oat.eco$b[, 1] * -1, 
+  ci.lb = my.rma.oat.eco$ci.lb * -1, 
+  ci.ub = my.rma.oat.eco$ci.ub * -1, 
+  Padj = my.rma.oat.eco$pval)
+
+#add in point size
+oat.pointsize.e <- data9 %>%
+  subset(Stressor == "OA + T") %>%
+ count(Stressor, REALM, PROVINCE, ECOREGION) 
+#combine data frames
+graphdata.ecoregion.oat <- full_join(graphdata.ecoregion.oat, oat.pointsize.e, 
+                                  by = c("ECOREGION","Stressor"))
+
+
+tecolist <- data9 %>%
+  subset(Stressor == "T", select = ECOREGION) %>%
+  unique() 
+tecolist <- sort(tecolist$ECOREGION)
+
+graphdata.ecoregion.t <- data.frame(
+  Type = rep("Ecoregion", times = length(tecolist)),
+  Stressor = rep("T", times = length(tecolist)),
+  ECOREGION = tecolist, 
+  mean = my.rma.t.eco$b[, 1] * -1,
+  ci.lb = my.rma.t.eco$ci.lb * -1,
+  ci.ub = my.rma.t.eco$ci.ub * -1,
+  Padj = my.rma.t.eco$pval)
+
+#add in point size
+t.pointsize.e <- data9 %>%
+  subset(Stressor == "T") %>%
+ count(Stressor, REALM, PROVINCE, ECOREGION) 
+#combine data frames
+graphdata.ecoregion.t <- full_join(graphdata.ecoregion.t, t.pointsize.e, 
+                                  by = c("ECOREGION","Stressor"))
+
+
+#combine into one
+graphdata <- bind_rows(graphdata.ecoregion.oa, graphdata.ecoregion.oat, 
+                       graphdata.ecoregion.t)
+
+#define point size
+pointsize <- data9 %>%
+  count(Stressor, ECOREGION)
+
+graphdata <- left_join(graphdata, pointsize, 
+                       by = c("variable" = "ECOREGION", "Stressor" = "Stressor"))  %>%
+  mutate(Stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+
+#this defines the elements to go in the plot, both the x and y and upper and lower CIs
+ggplot(data = graphdata, 
+       aes(x = factor(variable, level = ecoregion_order), 
+           y = mean, ymax = ci.ub, ymin = ci.lb,
+        color = col)) +
+   geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = n)) + 
+  scale_color_manual(values = c('gray30', 'firebrick2'),
+                     name = "Effect direction",
+                     labels = c("No effect", "Negative")) +
+   scale_size_continuous(range = c(0.1, 1),
+                         name = "Number of\ndata points") +
+  coord_flip() + 
+  facet_grid(~ stressor,
+             labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_y_continuous(breaks = seq(-6, 4, 2)) +
+  xlab("Metric") + ylab("Effect size") +
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.spacing.x = unit(1, "lines"),
+        panel.spacing.y = unit(1, "lines"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line()
+        )  
+
+#save plot
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "ecoregions.jpg",
+       width = 25, height = 15, units = "cm"
+       )
+
+```
+Stressor x Province
+```{r}
+province_list <-  unique(data9$PROVINCE)
+
+my.rma.oa.pro <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA"
+                               & Duration_days != "NA" 
+                               & deltapCO2 != "NA"),
+                     mods = ~ PROVINCE - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oa.pro)
+
+my.rma.oat.pro <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   #~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT
+                                   ),
+                     subset = (Stressor == "OA + T"
+                               & Duration_days != "NA" 
+                               & deltapCO2 != "NA"
+                               & deltaT != "NA"
+                               ),
+                     mods = ~ PROVINCE - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oat.pro)
+
+
+my.rma.t.pro <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                  # ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T"
+                               & Duration_days != "NA" 
+                               & deltaT != "NA"),
+                     mods = ~ PROVINCE - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.t.pro)
+
+#turn model output into a dataframe and convert back to % change instead of a log value
+oaprolist <- data9 %>%
+  subset(Stressor == "OA", select = PROVINCE) %>%
+  unique() 
+oaprolist <- sort(oaprolist$PROVINCE)
+
+graphdata.province.oa <- data.frame(
+  Type = rep("Province", times = length(oaprolist)),
+  Stressor = rep("OA", times = length(oaprolist)),
+  PROVINCE = oaprolist,
+  mean = my.rma.oa.pro$b[, 1] * -1, 
+  ci.lb = my.rma.oa.pro$ci.lb * -1, 
+  ci.ub = my.rma.oa.pro$ci.ub * -1, 
+  Padj = my.rma.oa.pro$pval)
+
+#also assign to Ecoregion column
+graphdata.province.oa$ECOREGION <- graphdata.province.oa$PROVINCE
+#add in point size
+oa.pointsize.p <- data9 %>%
+  subset(Stressor == "OA") %>%
+ count(Stressor, REALM, PROVINCE) 
+#combine data frames
+graphdata.province.oa <- full_join(graphdata.province.oa, oa.pointsize.p, 
+                                  by = c("PROVINCE","Stressor"))
+
+
+oatprolist <- data9 %>%
+  subset(Stressor == "OA + T" & deltapH != "NA", select = PROVINCE) %>%
+  unique() 
+oatprolist <- sort(oatprolist$PROVINCE)
+
+graphdata.province.oat <- data.frame(
+  Type = rep("Province", times = length(oatprolist)),
+  Stressor = rep("OA + T", times = length(oatprolist)),
+  PROVINCE = oatprolist,
+  mean = my.rma.oat.pro$b[, 1] * -1, 
+  ci.lb = my.rma.oat.pro$ci.lb * -1, 
+  ci.ub = my.rma.oat.pro$ci.ub * -1, 
+  Padj = my.rma.oat.pro$pval)
+
+#also assign to Ecoregion column
+graphdata.province.oat$ECOREGION <- graphdata.province.oat$PROVINCE
+#add in point size
+oat.pointsize.p <- data9 %>%
+  subset(Stressor == "OA + T") %>%
+ count(Stressor, REALM, PROVINCE) 
+#combine data frames
+graphdata.province.oat <- full_join(graphdata.province.oat, oat.pointsize.p, 
+                                  by = c("PROVINCE","Stressor"))
+
+
+tprolist <- data9 %>%
+  subset(Stressor == "T", select = PROVINCE) %>%
+  unique() 
+tprolist <- sort(tprolist$PROVINCE)
+
+graphdata.province.t <- data.frame(
+  Type = rep("Province", times = length(tprolist)),
+  Stressor = rep("T", times = length(tprolist)),
+  PROVINCE = tprolist, 
+  mean = my.rma.t.pro$b[, 1] * -1,
+  ci.lb = my.rma.t.pro$ci.lb * -1,
+  ci.ub = my.rma.t.pro$ci.ub * -1,
+  Padj = my.rma.t.pro$pval)
+
+#also assign to Ecoregion column
+graphdata.province.t$ECOREGION <- graphdata.province.t$PROVINCE
+#add in point size
+t.pointsize.p <- data9 %>%
+  subset(Stressor == "T") %>%
+ count(Stressor, REALM, PROVINCE) 
+#combine data frames
+graphdata.province.t <- full_join(graphdata.province.t, t.pointsize.p, 
+                                  by = c("PROVINCE","Stressor"))
+
+
+#combine into one
+graphdata <- bind_rows(graphdata.province.oa, graphdata.province.oat, graphdata.province.t)
+
+
+
+graphdata <- mutate(Stressor = fct_relevel(Stressor, "T", "OA + T", "OA"))
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+provinceorder <- c("Arctic", "Cold Temperate Northeast Pacific", 
+                   "Cold Temperate Northwest Pacific", "Cold Temperate Northwest Atlantic",
+                   "Northern European Seas", "Warm Temperate Northeast Pacific",
+                   "Warm Temperate Northwest Pacific", "Warm Temperate Southeastern Pacific",
+                   "Lusitanian", "Benguela", "Agulhas", "West Central Australian Shelf", 
+                   "East Central Australian Shelf", "Southwest Australian Shelf", 
+                   "Northern New Zealand", "Southeast Australian Shelf", 
+                   "Southern New Zealand", "Magellanic")
+
+
+#this defines the elements to go in the plot, both the x and y and upper and lower CIs
+ggplot(data = graphdata, 
+       aes(x = factor(PROVINCE, level = rev(provinceorder)), 
+           y = mean, ymax = ci.ub, ymin = ci.lb,
+        color = col)) +
+   geom_hline(aes(yintercept = 0), lty = 3, size = 1, color = "grey80") +
+  geom_pointrange(aes(size = n)) + 
+  scale_color_manual(values = c('gray30', 'firebrick2'),
+                     name = "Effect direction",
+                     labels = c("No effect", "Negative")) +
+   scale_size_continuous(range = c(0.1, 1),
+                         name = "Number of\ndata points") +
+  coord_flip() + 
+  facet_grid( ~ Stressor,
+             labeller = labeller(Stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_y_continuous(breaks = seq(-2, 2, 2)) +
+  xlab("Province") + ylab("Effect size") +
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines"))
+
+#save plot
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "provinces.jpg",
+       width = 20, height = 14, units = "cm"
+       )
+```
+Stressor x Realm
+```{r}
+realm_list <-  unique(data9$REALM)
+
+my.rma.oa.realm <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days),
+                                   #~ 1 | deltapCO2 ),
+                     subset = (Stressor == "OA"
+                               & Duration_days != "NA"
+                               #& deltapCO2 != "NA"
+                               ),
+                     mods = ~ REALM - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oa.realm)
+
+my.rma.oat.realm <- rma.mv(yi = yi, V = vi, data = data9, 
+                      random = list(~ 1 | Study,
+                                   #~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"
+                               & deltaT != "NA" ),
+                     mods = ~ REALM - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oat.realm)
+
+my.rma.t.realm <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T"
+                               & Duration_days != "NA" 
+                               & deltaT != "NA"),
+                     mods = ~ REALM - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.t.realm)
+
+#turn model output into a dataframe ankd convert back to % change instead of a log value
+oarealmlist <- data9 %>%
+  subset(Stressor == "OA", select = REALM) %>%
+  unique() 
+oarealmlist <- sort(oarealmlist$REALM)
+
+graphdata.realm.oa <- data.frame(
+  Type = rep("Realm", times = length(oarealmlist)),
+  Stressor = rep("OA", times = length(oarealmlist)),
+  REALM = oarealmlist,
+  mean = my.rma.oa.realm$b[, 1] * -1, 
+  ci.lb = my.rma.oa.realm$ci.lb * -1, 
+  ci.ub = my.rma.oa.realm$ci.ub * -1, 
+  Padj = my.rma.oa.realm$pval)
+
+#also assign to Province column
+graphdata.realm.oa$PROVINCE <- graphdata.realm.oa$REALM
+#also assign to Ecoregion column
+graphdata.realm.oa$ECOREGION <- graphdata.realm.oa$REALM
+#add in point size
+oa.pointsize.r <- data9 %>%
+  subset(Stressor == "OA") %>%
+ count(Stressor, REALM) 
+#combine data frames
+graphdata.realm.oa <- left_join(graphdata.realm.oa, oa.pointsize.r, 
+                                  by = c("REALM", "Stressor"))
+
+#OAT
+oatrealmlist <- data9 %>%
+  subset(Stressor == "OA + T", select = REALM) %>%
+  unique() 
+oatrealmlist <- sort(oatrealmlist$REALM)
+
+graphdata.realm.oat <- data.frame(
+  Type = rep("Realm", times = length(oatrealmlist)),
+  Stressor = rep("OA + T", times = length(oatrealmlist)),
+  REALM = oatrealmlist,
+  mean = my.rma.oat.realm$b[, 1] * -1, 
+  ci.lb = my.rma.oat.realm$ci.lb * -1, 
+  ci.ub = my.rma.oat.realm$ci.ub * -1, 
+  Padj = my.rma.oat.realm$pval)
+
+#also assign to Province column
+graphdata.realm.oat$PROVINCE <- graphdata.realm.oat$REALM
+#also assign to Ecoregion column
+graphdata.realm.oat$ECOREGION <- graphdata.realm.oat$REALM
+#add in point size
+oat.pointsize.r <- data9 %>%
+  subset(Stressor == "OA + T") %>%
+ count(Stressor, REALM) 
+#combine data frames
+graphdata.realm.oat <- left_join(graphdata.realm.oat, oat.pointsize.r, 
+                                  by = c("REALM", "Stressor"))
+
+# T
+trealmlist <- data9 %>%
+  subset(Stressor == "T", select = REALM) %>%
+  unique() 
+trealmlist <- sort(trealmlist$REALM)
+
+graphdata.realm.t <- data.frame(
+  Type = rep("Realm", times = length(trealmlist)),
+  Stressor = rep("T", times = length(trealmlist)),
+  REALM = trealmlist, 
+  mean = my.rma.t.realm$b[, 1] * -1,
+  ci.lb = my.rma.t.realm$ci.lb * -1,
+  ci.ub = my.rma.t.realm$ci.ub * -1,
+  Padj = my.rma.t.realm$pval)
+
+#also assign to Province column
+graphdata.realm.t$PROVINCE <- graphdata.realm.t$REALM
+#also assign to Ecoregion column
+graphdata.realm.t$ECOREGION <- graphdata.realm.t$REALM
+#add in point size
+t.pointsize.r <- data9 %>%
+  subset(Stressor == "T") %>%
+ count(Stressor, REALM) 
+#combine data frames
+graphdata.realm.t <- left_join(graphdata.realm.t, t.pointsize.r, 
+                                  by = c("REALM", "Stressor"))
+
+
+#combine into one
+graphdata <- bind_rows(graphdata.realm.oa, graphdata.realm.oat, graphdata.realm.t) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+#define point size
+pointsize <- data9 %>%
+  count(Stressor, REALM)
+
+graphdata <- cbind(graphdata, pointsize = pointsize$n)
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+regionorder <- c("Arctic", "Temperate Northern Atlantic", "Temperate Northern Pacific",
+                 "Temperate South America", "Temperate Southern Africa", "Temperate Australasia")
+
+#this defines the elements to go in the plot, both the x and y and upper and lower CIs
+ggplot(data = graphdata, 
+       aes(x = factor(variable, level = rev(regionorder)), 
+           y = mean, ymax = ci.ub, ymin = ci.lb,
+        #label = ifelse(Padj < 0.05, "*", "")
+        color = col)) +
+   geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  #geom_text(nudge_y = 0.5, nudge_x = 0.2, size = 4) +
+  scale_x_discrete(limits = rev(regionorder)) +
+  scale_color_manual(values = c('dodgerblue2','gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("Positive","No effect", "Negative")) +
+  coord_flip() + 
+  scale_size_continuous(range = c(0.2, 1.5), 
+                        name = "Number of\ndata points") +
+   facet_grid(~ Stressor, labeller = labeller(Stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  xlab("Realm") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines"))
+
+#save plot
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "realms.jpg",
+       width = 18, height = 10, units = "cm"
+       )
+```
+Stressor x latitude (abs value)
+```{r}
+data9$ablat <- abs(data9$Latitude)
+data10 <- filter(data9, Duration_days != "NF")
+
+my.rma.oa.lat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ ablat, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oa.lat)
+
+regplot(my.rma.oa.lat, mod="ablat", xlab="Absolute latitude", 
+        ylim = c(-10, 10), 
+        refline = 0)
+
+
+
+my.rma.oat.lat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   #~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA + T"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"
+                               & deltapCO2 != "NA"
+                               ),
+                     mods = ~ ablat, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.oat.lat)
+
+regplot(my.rma.oat.lat, mod="ablat", xlab="Absolute latitude", 
+        ylim = c(-10, 10), 
+        refline = 0)
+
+
+
+my.rma.t.lat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ ablat, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.rma.t.lat)
+
+regplot(my.rma.t.lat, mod="ablat", xlab="Absolute latitude", 
+        ylim = c(-5, 15), 
+        refline = 0)
+
+```
+Biochemical composition
+```{r}
+#have to skip step 6
+#data6 <- data5
+#now run steps 7 - 10 like normal
+data10 <- filter(data9, Duration_days != "NF")
+
+## Biochemical composition
+my.bio.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   #~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 Response_category == "Biochemical composition"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.bio.oa)
+
+#create dataset to graph
+#create a data frame with all response variables
+bio <- filter(data9, Response_category == "Biochemical composition")
+resvarlist <- data.frame(response_variable = unique(bio$Response_variable))
+
+#create a dataframe with the model output
+graphdata.bio.oa <- data.frame(Stressor = rep("OA", times = length(my.bio.oa$ci.lb)),
+                  Response_variable = my.bio.oa$b[,0],
+                  mean = my.bio.oa$b[, 1] * -1, 
+                  ci.lb = my.bio.oa$ci.lb * -1,
+                  ci.ub = my.bio.oa$ci.ub * -1,
+                  Padj = my.bio.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.bio.oa$Response_variable <- rownames(graphdata.bio.oa)
+#remove "factor(Response_variable)" from names
+graphdata.bio.oa$Response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.bio.oa$Response_variable)
+
+
+#T
+my.bio.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species, 
+                                   ~ 1 | Duration_days), 
+                                   #~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 Response_category == "Biochemical composition"
+                               & Duration_days != "NA"),
+                              # & deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.bio.t)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.bio.t <- data.frame(Stressor = rep("T", times = length(my.bio.t$ci.lb)),
+                  Response_variable = my.bio.t$b[,0],
+                  mean = my.bio.t$b[, 1] * -1, 
+                  ci.lb = my.bio.t$ci.lb *- 1,
+                  ci.ub = my.bio.t$ci.ub * -1,
+                  Padj = my.bio.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.bio.t$Response_variable <- rownames(graphdata.bio.t)
+#remove "responsevariable" from names
+graphdata.bio.t$Response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.bio.t$Response_variable)
+
+
+#OA + T
+my.bio.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days),
+                                   #~ 1 | deltapCO2,
+                                   #~ 1 | deltaT ),
+                     subset = (Stressor == "OA + T" & 
+                                 Response_category == "Biochemical composition"
+                               & Duration_days != "NA"),
+                               #& deltapCO2 != "NA"
+                               #& deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.bio.oat)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.bio.oat <- data.frame(Stressor = rep("OA + T", 
+                                               times = length(my.bio.oat$ci.lb)),
+                  Response_variable = my.bio.oat$b[,0],
+                  mean = my.bio.oat$b[, 1] * -1, 
+                  ci.lb = my.bio.oat$ci.lb * -1,
+                  ci.ub = my.bio.oat$ci.ub * -1,
+                  Padj = my.bio.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.bio.oat$Response_variable <- rownames(graphdata.bio.oat)
+#remove "responsevariable" from names
+graphdata.bio.oat$Response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              as.factor(graphdata.bio.oat$Response_variable))
+
+
+graphdata <- bind_rows(graphdata.bio.oa, graphdata.bio.oat, graphdata.bio.t) %>%
+  mutate(Stressor = fct_relevel(Stressor, "T", "OA + T", "OA"))
+
+#set point size equal to number of rows of data
+pointsize <- bio %>%
+ count(Stressor, Response_variable)
+#add point size as a variable to the graphing data frame
+graphdata <- left_join(graphdata, pointsize, by = c("Stressor", "Response_variable"))
+
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+bio.order <- c("C:N ratio", "Nitrogen", "Carbon", "Proteins", "Mannitol", 
+               "Soluble carbohydrates", "Delta13 Carbon", "Lipids",  "Epsilon p",  
+               "Laminarin", "DNA", "RNA", "RNA : DNA ratio", "Alanine", 
+               "Alginic acid", "Alpha-linolenic acid", "Amino acid", 
+               "Amino-nitrogen content", "Arachidonic acid", "Arginine", "Aspartate", 
+               "Cellulose", "Cysteine", "Delta15 Nitrogen", "Eicosapentaenoic acid", 
+               "Eicosatrienoic acid", "Fucoidan", "Gamma-linolenic acid", 
+               "Glutamine", "Glycine", "Histidine", "Isoleucine", "Leucine", 
+               "Linoleic acid", "Lysine", "Methionine", "NO3- nitrogen", 
+               "Phenylalanine", "Proline", "Serine", "Threonine", "Tyrosine", 
+               "Valine", "2-oxoglutarate", "Citrate", "Free arginine", 
+               "Free aspartate", "Free glutamine", "Fumarate","Malate", 
+               "Monounsaturated fatty acids", "Oxaloacetate", 
+               "Polyunsaturated fatty acids", "Pyruvate", "Saturated fatty acids", 
+               "Succinate", "Total non-structural carbohydrates")
+bio.labels <- c("(-)C:N ratio", "Nitrogen", "Carbon", "Proteins", "Mannitol", 
+                "Soluble carbohydrates", "(-)Delta13 Carbon", "Lipids", 
+                "Epsilon p",  "Laminarin", "(-)DNA", "RNA", "RNA : DNA ratio", 
+                "Alanine", "Alginic acid", "Alpha-linolenic acid", "Amino acid", 
+                "Amino-nitrogen content", "Arachidonic acid", "Arginine", 
+                "Aspartate", "Cellulose", "Cysteine", "Delta15 Nitrogen", 
+                "Eicosapentaenoic acid", "Eicosatrienoic acid", "Fucoidan", 
+                "Gamma-linolenic acid", "Glutamine", "Glycine", "Histidine", 
+                "Isoleucine", "Leucine", "Linoleic acid", "Lysine", "Methionine", 
+                "NO3- nitrogen", "Phenylalanine", "Proline", "Serine", "Threonine", 
+                "Tyrosine", "Valine", "2-oxoglutarate", "Citrate", "Free arginine", 
+                "Free aspartate", "Free glutamine", "Fumarate", "Malate", 
+                "Monounsaturated fatty acids", "Oxaloacetate",
+                "Polyunsaturated fatty acids", "Pyruvate", "(-)Saturated fatty acids",
+                "Succinate", "(-)Total non-structural carbohydrates")
+
+
+#graph it 
+ggplot(data = graphdata, 
+       aes(x = factor(Response_variable, level = rev(bio.order)), 
+           y = mean, ymax = ci.ub, ymin = ci.lb, #label = ifelse(Padj < 0.05, "*", "")
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = n)) + 
+  #geom_text(vjust = -0.1, hjust = -0.3, size = 4) +
+  scale_color_manual(values = c('dodgerblue2','gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("Positive", "No effect", "Negative")) +
+  scale_x_discrete(labels = rev(bio.labels)) +
+  coord_flip() + 
+  facet_grid(~ Stressor, labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(range = c(0.1, 1), name = "Number of\ndata points") +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines")) 
+
+
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "biochem.jpg",
+       width = 30, height = 20, units = "cm")
+
+```
+Enzyme activity
+```{r}
+#have to skip step 6
+#data6 <- data5
+#now run steps 7 - 10 like normal
+
+## Enzyme activity
+my.enz.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 Response_category == "Enzyme activity"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.enz.oa)
+
+#create dataset to graph
+#create a data frame with all response variables
+enz <- filter(data9, Response_category == "Enzyme activity")
+
+resvarlist <- data.frame(Response_variable = unique(enz$Response_variable))
+
+#create a dataframe with the model output
+graphdata.enz.oa <- data.frame(Stressor = rep("OA", times = length(my.enz.oa$ci.lb)),
+                  Response_variable = my.enz.oa$b[,0],
+                  mean = my.enz.oa$b[, 1] * -1, 
+                  ci.lb = my.enz.oa$ci.lb * -1,
+                  ci.ub = my.enz.oa$ci.ub * -1,
+                  Padj = my.enz.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.enz.oa$Response_variable <- rownames(graphdata.enz.oa)
+#remove "factor(Response_variable)" from names
+graphdata.enz.oa$Response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.enz.oa$Response_variable)
+
+
+#T
+my.enz.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   #~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 Response_category == "Enzyme activity"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.enz.t)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.enz.t <- data.frame(Stressor = rep("T", times = length(my.enz.t$ci.lb)),
+                  Response_variable = my.enz.t$b[,0],
+                  mean = my.enz.t$b[, 1] * -1, 
+                  ci.lb = my.enz.t$ci.lb *- 1,
+                  ci.ub = my.enz.t$ci.ub * -1,
+                  Padj = my.enz.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.enz.t$Response_variable <- rownames(graphdata.enz.t)
+#remove "responsevariable" from names
+graphdata.enz.t$Response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.enz.t$Response_variable)
+
+
+# OA + T
+my.enz.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T" & 
+                                 Response_category == "Enzyme activity"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.enz.oat)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.enz.oat <- data.frame(Stressor = rep("OA + T", times = length(my.enz.oat$ci.lb)),
+                  Response_variable = my.enz.oat$b[,0],
+                  mean = my.enz.oat$b[, 1] * -1, 
+                  ci.lb = my.enz.oat$ci.lb * -1,
+                  ci.ub = my.enz.oat$ci.ub * -1,
+                  Padj = my.enz.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.enz.oat$Response_variable <- rownames(graphdata.enz.oat)
+#remove "factor(Response_variable)" from names
+graphdata.enz.oat$Response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.enz.oat$Response_variable)
+
+
+
+graphdata <- rbind(graphdata.enz.oa, graphdata.enz.t, graphdata.enz.oat) %>%
+  mutate(Stressor = fct_relevel(Stressor, "T", "OA + T", "OA"))
+
+#set point size equal to number of rows of data
+pointsize <- enz %>%
+ count(Stressor, Response_variable) 
+countstudy <- enz %>%
+  group_by(Stressor, Response_variable) %>%
+  summarize(count = n_distinct(Study))
+#add point size as a variable to the graphing data frame
+graphdata <- left_join(graphdata, pointsize, by = c("Stressor", "Response_variable"))
+graphdata <- left_join(graphdata, countstudy, by = c("Stressor", 
+                                                     "Response_variable"))
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+#make a vector of labels for the y-axis
+enzlabels <- data.frame(Sign_change = enz$Sign_change, 
+                        Response_variable = enz$Response_variable) %>%
+  arrange(Response_variable) %>%
+  distinct(Response_variable, .keep_all = TRUE) #The .keep_all function is used to retain all other variables in the output data frame.
+enzlabels$labels <- with(enzlabels, ifelse(enzlabels$Sign_change == "-", 
+                    paste0("(-)", enzlabels$Response_variable), 
+                    paste0(enzlabels$Response_variable)))
+enzlabels <- subset(enzlabels, Response_variable %in% graphdata$Response_variable)
+
+enzorder <- c("Nitrate reductase activity", "Total carbonic anhydrase", 
+              "External carbonic anhydrase", "Peroxidase activity", 
+              "Glutathione reductase activity", "Glutathione peroxidase activity", 
+              "RuBisCO",  "Glutamine synthetase activity", "GADPH activity", 
+              "GAPDH activity", "L-aspartate activity", "Malate dehydrogenase activity", 
+              "Mannitol-1-phosphate dehydrogenase activity",
+              "Phosphoenolpyruvate carboxykinase activity", "Glutamate synthase", 
+              "Isocitrate dehydrogenase", "Phenylalanine ammonia-lyase activity", 
+              "Polyphenol oxidase activity", "Pyruvate kinase")
+
+enzlabels <- c("Nitrate reductase", "(-)Total carbonic anhydrase", 
+               "External carbonic anhydrase", "(-)Peroxidase", 
+              "(-)Glutathione reductase", "(-)Glutathione peroxidase","RuBisCO",  
+              "Glutamine synthetase", "GADPH", "GAPDH", "L-aspartate",
+              "Malate dehydrogenase", "Mannitol-1-phosphate dehydrogenase",
+              "Phosphoenolpyruvate carboxykinase", "Glutamate synthase", 
+              "Isocitrate dehydrogenase", "(-)Phenylalanine ammonia-lyase", 
+              "(-)Polyphenol oxidase", "Pyruvate kinase")
+
+
+#graph it 
+ggplot(data = graphdata, 
+       aes(x = factor(Response_variable, level = rev(enzorder)),
+           y = mean, ymax = ci.ub, ymin = ci.lb, #label = ifelse(Padj < 0.05, "*", "")
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = n)) + 
+  scale_color_manual(values = c('dodgerblue2','gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("Negative","No effect", "Negative")) +
+  #geom_text(vjust = -0.1, hjust = -0.3, size = 4) +
+  scale_x_discrete(labels = rev(enzlabels)) +
+  coord_flip() + 
+  facet_grid(~ Stressor, labeller = labeller(Stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(#limits = c(1, 850), 
+    range = c(0.1, 1.5), name = "Number of\ndata points") +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines"))
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "enzyme.jpg",
+       width = 30, height = 10, units = "cm")
+
+```
+Fluorescence
+```{r}
+#have to skip step 6
+#data6 <- data5
+#now run steps 7 - 10 like normal
+
+## Fluorescence
+my.flu.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days),
+                                  # ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 Response_category == "Fluorescence"
+                               & Duration_days != "NA"),
+                              # & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.flu.oa)
+
+#create dataset to graph
+#create a data frame with all response variables
+flu <- filter(data9, Response_category == "Fluorescence")
+
+resvarlist <- data.frame(response_variable = unique(flu$Response_variable))
+
+#create a dataframe with the model output
+graphdata.flu.oa <- data.frame(stressor = rep("OA", times = length(my.flu.oa$ci.lb)),
+                  response_variable = my.flu.oa$b[,0],
+                  mean = my.flu.oa$b[, 1] * -1, 
+                  ci.lb = my.flu.oa$ci.lb * -1,
+                  ci.ub = my.flu.oa$ci.ub * -1,
+                  Padj = my.flu.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.flu.oa$response_variable <- rownames(graphdata.flu.oa)
+#remove "factor(Response_variable)" from names
+graphdata.flu.oa$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.flu.oa$response_variable)
+
+
+#T
+my.flu.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 Response_category == "Fluorescence"
+                               & Duration_days != "NA" 
+                               & deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.flu.t)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.flu.t <- data.frame( stressor = rep("T", times = length(my.flu.t$ci.lb)),
+                  response_variable = my.flu.t$b[,0],
+                  mean = my.flu.t$b[, 1] * -1, 
+                  ci.lb = my.flu.t$ci.lb * -1,
+                  ci.ub = my.flu.t$ci.ub * -1,
+                  Padj = my.flu.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.flu.t$response_variable <- rownames(graphdata.flu.t)
+#remove "responsevariable" from names
+graphdata.flu.t$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.flu.t$response_variable)
+
+
+##OA + T
+my.flu.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                  # ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T" & 
+                                 Response_category == "Fluorescence"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.flu.oat)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.flu.oat <- data.frame(stressor = rep("OA + T", 
+                                               times = length(my.flu.oat$ci.lb)),
+                  response_variable = my.flu.oat$b[,0],
+                  mean = my.flu.oat$b[, 1] * -1, 
+                  ci.lb = my.flu.oat$ci.lb * -1,
+                  ci.ub = my.flu.oat$ci.ub * -1,
+                  Padj = my.flu.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.flu.oat$response_variable <- rownames(graphdata.flu.oat)
+#remove "responsevariable" from names
+graphdata.flu.oat$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              as.factor(graphdata.flu.oat$response_variable))
+
+
+graphdata <- bind_rows(graphdata.flu.oa, graphdata.flu.oat, graphdata.flu.t) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+#set point size equal to number of rows of data
+pointsize <- flu %>%
+ count(Stressor, Response_variable) 
+countstudy <- flu %>%
+  group_by(Stressor, Response_variable) %>%
+  summarize(count = n_distinct(Study))
+#add point size as a variable to the graphing data frame
+graphdata <- cbind(graphdata, pointsize = pointsize$n, studycount = countstudy$count)
+#add in a column to indicate color of dots
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+#make a vector of labels for the y-axis
+flulabels <- data.frame(Sign_change = flu$Sign_change, 
+                        Response_variable = flu$Response_variable) %>%
+  arrange(Response_variable) %>%
+  distinct(Response_variable, .keep_all = TRUE) #The .keep_all function is used to retain all other variables in the output data frame.
+flulabels$labels <- with(flulabels, ifelse(flulabels$Sign_change == "-", 
+                    paste0("(-)", flulabels$Response_variable), 
+                    paste0(flulabels$Response_variable)))
+fluorder <- c("Fv/Fm", "Fv/Fm reduction", "Fv/Fo", "YII", "Alpha", "Ek", "Ec", "rETRmax", "ETRmax", "rETR","NPQ", "Photoinhibition")
+flulabels <- c("Fv/Fm", "(-)Fv/Fm reduction", "Fv/Fo", "YII", "Alpha", "Ek", "(-)Ec", "rETRmax", "ETRmax", "rETR","NPQ", "(-)Photoinhibition")
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#graph it 
+ggplot(data = graphdata, 
+       aes(x = factor(response_variable, level = rev(fluorder)), 
+           y = mean, ymax = ci.ub, ymin = ci.lb,#label = ifelse(Padj < 0.05, "*", "")
+       color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  #geom_text(vjust = -0.1, hjust = -0.3, size = 4) +
+  scale_x_discrete(labels = rev(flulabels)) +
+  scale_color_manual(values = c('gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("No effect", "Negative")) +
+  scale_size_continuous(range = c(0.1, 1.5), name = "Number of\ndata points") +
+  coord_flip() + 
+  facet_grid(~ stressor, labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines"))
+
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "fluorescence.jpg",
+       width = 20, height = 10, units = "cm")
+```
+Growth
+```{r}
+#have to skip step 6
+#data6 <- data5
+#now run steps 7 - 10 like normal
+data10 <- filter(data9, Timepoint != "NF")
+
+## Growth
+my.gro.oa <- rma.mv(yi = yi, V = vi, data = data10, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   #~ 1 | Duration_days), 
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 Response_category == "Growth"
+                               #& Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.gro.oa)
+
+#create dataset to graph
+#create a data frame with all response variables
+gro <- filter(data9, Response_category == "Growth")
+
+resvarlist <- data.frame(response_variable = unique(gro$Response_variable))
+
+#create a dataframe with the model output
+graphdata.gro.oa <- data.frame(stressor = rep("OA", times = length(my.gro.oa$ci.lb)),
+                  response_variable = my.gro.oa$b[,0],
+                  mean = my.gro.oa$b[, 1] * -1, 
+                  ci.lb = my.gro.oa$ci.lb * -1,
+                  ci.ub = my.gro.oa$ci.ub * -1,
+                  Padj = my.gro.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.gro.oa$response_variable <- rownames(graphdata.gro.oa)
+#remove "factor(Response_variable)" from names
+graphdata.gro.oa$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.gro.oa$response_variable)
+
+#T
+my.gro.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 Response_category == "Growth"
+                               & Duration_days != "NA"
+                               & deltaT != "NA" ),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.gro.t)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.gro.t <- data.frame( stressor = rep("T", times = length(my.gro.t$ci.lb)),
+                  response_variable = my.gro.t$b[,0],
+                  mean = my.gro.t$b[, 1] * -1, 
+                  ci.lb = my.gro.t$ci.lb * -1,
+                  ci.ub = my.gro.t$ci.ub * -1,
+                  Padj = my.gro.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.gro.t$response_variable <- rownames(graphdata.gro.t)
+#remove "responsevariable" from names
+graphdata.gro.t$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.gro.t$response_variable)
+
+
+##OA + T
+my.gro.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA + T" & 
+                                 Response_category == "Growth"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.gro.oat)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.gro.oat <- data.frame(stressor = rep("OA + T", 
+                                               times = length(my.gro.oat$ci.lb)),
+                  response_variable = my.gro.oat$b[,0],
+                  mean = my.gro.oat$b[, 1] * -1, 
+                  ci.lb = my.gro.oat$ci.lb * -1,
+                  ci.ub = my.gro.oat$ci.ub * -1,
+                  Padj = my.gro.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.gro.oat$response_variable <- rownames(graphdata.gro.oat)
+#remove "responsevariable" from names
+graphdata.gro.oat$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              as.factor(graphdata.gro.oat$response_variable))
+
+graphdata <- bind_rows(graphdata.gro.oa, graphdata.gro.oat, graphdata.gro.t) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+#set point size equal to number of rows of data
+pointsize <- gro %>%
+ count(Stressor, Response_variable) 
+countstudy <- gro %>%
+  group_by(Stressor, Response_variable) %>%
+  summarize(count = n_distinct(Study))
+#add point size as a variable to the graphing data frame
+graphdata <- cbind(graphdata, pointsize = pointsize$n, studycount = countstudy$count)
+
+
+#remove outlier variables
+#graphdata <- subset(graphdata, response_variable != "Elongation rate" & stressor != "OA + T")
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+growth.order <- c("Area", "Area change", "Weight", "Weight change",
+                  "Length", "Elongation rate",  "Diameter", "Diameter change", 
+                  "Number of cells",  "Germ tube length", 
+                  "Relative size", "Perforation area")
+
+growth.labels <- c("Area", "Area change", "Biomass", "Biomass change",
+                   "Length", "Elongation rate", "Diameter", "Diameter change", 
+                  "Number of cells",  "Germ tube length", 
+                  "Relative size", "Perforation area")
+
+#graph it 
+ggplot(data = graphdata, 
+       aes(x = factor(response_variable, level = rev(growth.order)), 
+           y = mean, ymax = ci.ub, ymin = ci.lb, #label = ifelse(Padj < 0.05, "*", "")
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("No effect", "Negative")) +
+  #geom_text(vjust = -0.1, hjust = -0.4, size = 5) +
+  scale_x_discrete(labels = rev(growth.labels)) +
+  coord_flip() + 
+  facet_grid(~ stressor, labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "Number of\ndata points") +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines"))
+
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "Growth.jpg",
+       width = 20, height = 10, units = "cm")
+
+```
+Net primary productivity
+```{r}
+#have to skip step 6
+data6 <- data5
+#now run steps 7 - 10 like normal
+data10 <- filter(data9, Timepoint != "NF")
+
+## Oxygen evolution
+my.oxy.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 Response_category == "Net primary productivity"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.oxy.oa)
+
+#create dataset to graph
+#create a data frame with all response variables
+oxy <- filter(data9, Response_category == "Net primary productivity")
+
+resvarlist <- data.frame(Response_variable = unique(oxy$Response_variable))
+
+#create a dataframe with the model output
+graphdata.oxy.oa <- data.frame(Stressor = rep("OA", times = length(my.oxy.oa$ci.lb)),
+                  Response_variable = my.oxy.oa$b[,0],
+                  mean = my.oxy.oa$b[, 1] * -1, 
+                  ci.lb = my.oxy.oa$ci.lb * -1,
+                  ci.ub = my.oxy.oa$ci.ub * -1,
+                  Padj = my.oxy.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.oxy.oa$Response_variable <- rownames(graphdata.oxy.oa)
+#remove "factor(Response_variable)" from names
+graphdata.oxy.oa$Response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.oxy.oa$Response_variable)
+
+#T
+my.oxy.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   #~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 Response_category == "Net primary productivity"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.oxy.t)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.oxy.t <- data.frame(Stressor = rep("T", times = length(my.oxy.t$ci.lb)),
+                  Response_variable = my.oxy.t$b[,0],
+                  mean = my.oxy.t$b[, 1] * -1, 
+                  ci.lb = my.oxy.t$ci.lb * -1,
+                  ci.ub = my.oxy.t$ci.ub * -1,
+                  Padj = my.oxy.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.oxy.t$Response_variable <- rownames(graphdata.oxy.t)
+#remove "responsevariable" from names
+graphdata.oxy.t$Response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.oxy.t$Response_variable)
+
+
+##OA + T
+my.oxy.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T" & 
+                                 Response_category == "Net primary productivity"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.oxy.oat)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.oxy.oat <- data.frame(Stressor = rep("OA + T", 
+                                               times = length(my.oxy.oat$ci.lb)),
+                  Response_variable = my.oxy.oat$b[,0],
+                  mean = my.oxy.oat$b[, 1] * -1, 
+                  ci.lb = my.oxy.oat$ci.lb * -1,
+                  ci.ub = my.oxy.oat$ci.ub * -1,
+                  Padj = my.oxy.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.oxy.oat$Response_variable <- rownames(graphdata.oxy.oat)
+#remove "responsevariable" from names
+graphdata.oxy.oat$Response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              as.factor(graphdata.oxy.oat$Response_variable))
+
+graphdata <- bind_rows(graphdata.oxy.oa, graphdata.oxy.oat, graphdata.oxy.t) %>%
+  mutate(Stressor = fct_relevel(Stressor, "T", "OA + T", "OA"))
+
+#set point size equal to number of rows of data
+pointsize <- oxy %>%
+ count(Stressor, Response_variable) 
+countstudy <- oxy %>%
+  group_by(Stressor, Response_variable) %>%
+  summarize(count = n_distinct(Study))
+#add point size as a variable to the graphing data frame
+graphdata <- left_join(graphdata, pointsize, by = c("Stressor", "Response_variable"))
+graphdata <- left_join(graphdata, countstudy, by = c("Stressor", "Response_variable"))
+
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+oxyorder <- c("Net photosynthesis", "NPmax", "GPmax", "Gross photosynthesis", "Carbon fixation rate", "DOC release rate", "Photosynthetic quotient", "CO2 uptake", "Carbon acquisition", "Nitrate uptake", "Ammonium uptake", "Bicarbonate uptake", "pH change", "Oxygen evolution inhibition rate", "Photosynthesis : Respiration ratio", "POC release rate", "Total alkalinity", "Vmax")
+oxylabels <- c("Net photosynthesis", "Max net photosynthesis ", "Max gross photosynthesis", "Gross photosynthesis", "Carbon fixation rate", "DOC release rate", "Photosynthetic quotient", "CO2 uptake", "Carbon acquisition", "Nitrate uptake", "Ammonium uptake", "Bicarbonate uptake", "pH change", "Oxygen evolution inhibition rate", "Photosynthesis : Respiration ratio", "POC release rate", "Total alkalinity", "Vmax")
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+
+#graph it 
+ggplot(data = graphdata, 
+       aes(x = factor(Response_variable, level = rev(oxyorder)), 
+           y = mean, ymax = ci.ub, ymin = ci.lb, #label = ifelse(Padj < 0.05, "*", "")
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = n )) + 
+  #geom_text(vjust = -0.1, hjust = -0.4, size = 5) +
+  scale_x_discrete(limits = rev(oxyorder), labels = rev(oxylabels)) +
+  scale_color_manual(values = c('dodgerblue2','gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("Positive","No effect", "Negative")) +
+  coord_flip() + 
+  facet_grid(~ Stressor, labeller = labeller(Stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "Number of\ndata points") +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines")) 
+#insert n= on the side
+
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "oxygenevolution.jpg",
+       width = 20, height = 12, units = "cm")
+```
+Pigments
+```{r}
+#have to skip step 6
+data6 <- data5
+#now run steps 7 - 10 like normal
+data10 <- filter(data9, Timepoint == 'F')
+
+## Pigments
+my.pig.oa <- rma.mv(yi = yi, V = vi, data = data10, 
+                     random = list(~ 1 | Study,
+                               ~ 1 | Species,
+                               #~ 1 | Duration_days,
+                               ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 Response_category == "Pigments"
+                               #& Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.pig.oa)
+
+#create dataset to graph
+#create a data frame with all response variables
+pig <- filter(data9, Response_category == "Pigments")
+
+resvarlist <- data.frame(response_variable = unique(pig$Response_variable))
+
+#create a dataframe with the model output
+graphdata.pig.oa <- data.frame(stressor = rep("OA", times = length(my.pig.oa$ci.lb)),
+                  response_variable = my.pig.oa$b[,0],
+                  mean = my.pig.oa$b[, 1] * -1, 
+                  ci.lb = my.pig.oa$ci.lb * -1,
+                  ci.ub = my.pig.oa$ci.ub * -1,
+                  Padj = my.pig.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.pig.oa$response_variable <- rownames(graphdata.pig.oa)
+#remove "factor(Response_variable)" from names
+graphdata.pig.oa$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.pig.oa$response_variable)
+
+#T
+my.pig.t <- rma.mv(yi = yi, V = vi, data = data10, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   #~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 Response_category == "Pigments"
+                               #& Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.pig.t)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.pig.t <- data.frame( stressor = rep("T", times = length(my.pig.t$ci.lb)),
+                  response_variable = my.pig.t$b[,0],
+                  mean = my.pig.t$b[, 1] * -1, 
+                  ci.lb = my.pig.t$ci.lb * -1,
+                  ci.ub = my.pig.t$ci.ub * -1,
+                  Padj = my.pig.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.pig.t$response_variable <- rownames(graphdata.pig.t)
+#remove "responsevariable" from names
+graphdata.pig.t$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.pig.t$response_variable)
+
+
+##OA + T
+my.pig.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T" & 
+                                 Response_category == "Pigments"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, #exact same output with/without mods
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.pig.oat)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.pig.oat <- data.frame(stressor = rep("OA + T", 
+                                               times = length(my.pig.oat$ci.lb)),
+                  response_variable = "Chlorophyll a", 
+                  mean = my.pig.oat$b[, 1] * -1, 
+                  ci.lb = my.pig.oat$ci.lb * -1,
+                  ci.ub = my.pig.oat$ci.ub * -1,
+                  Padj = my.pig.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.pig.oat$response_variable <- rownames(graphdata.pig.oat)
+#remove "responsevariable" from names
+graphdata.pig.oat$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              as.factor(graphdata.pig.oat$response_variable))
+
+graphdata <- bind_rows(graphdata.pig.oa, graphdata.pig.oat, graphdata.pig.t) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+#set point size equal to number of rows of data
+pointsize <- pig %>%
+ count(Stressor, Response_variable) 
+countstudy <- pig %>%
+  group_by(Stressor, Response_variable) %>%
+  summarize(count = n_distinct(Study))
+#add point size as a variable to the graphing data frame
+graphdata <- cbind(graphdata, pointsize = pointsize$n, studycount = countstudy$count)
+
+#make a vector of labels for the y-axis
+piglabels <- data.frame(Sign_change = pig$Sign_change, 
+                        Response_variable = pig$Response_variable) %>%
+  arrange(Response_variable) %>%
+  distinct(Response_variable, .keep_all = TRUE) #The .keep_all function is used to retain all other variables in the output data frame.
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+#set order of y axis
+pigment.order <- c("Chlorophyll a", "Chlorophyll c", "Chlorophyll c : Chlorophyll a ratio", "Chlorophyll a : Chlorophyll c ratio", "Fucoxanthin", "Fucoxanthin : Chlorophyll a ratio", "De-epoxidation state", "Xanthophyll cycle pigment pool", "Xanthophyll cycle pigment pool : Chlorophyll a ratio", "Beta-carotene", "Beta-carotene : Chlorophyll a ratio", "Carotenoids", "Accessory pigment pool", "Accessory pigment : Chlorophyll a ratio", "Antheraxanthin : Chlorophyll a ratio", "D1 protein", "Violaxanthin", "Violaxanthin : Chlorophyll a ratio", "Zeaxanthin", "Zeaxanthin : Chlorophyll a ratio", "Viola+Zeaxanthin : Chlorophyll a ratio")
+pigment.labels <- c(expression(paste("chlorophyll-", italic("a"))), expression(paste("chlorophyll-", italic("c"))), expression(paste("chlorophyll-", italic("c")," : chlorophyll-", italic("a"))), expression(paste("(-)chlorophyll-", italic("a")," : chlorophyll-", italic("c"))), "Fucoxanthin", expression(paste("Fucoxanthin : chlorophyll-", italic("a"))), "De-epoxidation state", "Xanthophyll cycle pigment pool", expression(paste("Xanthophyll cycle pigment pool : chlorophyll-", italic("a"))), "(-)Beta-carotene", expression(paste("(-)Beta-carotene : chlorophyll-", italic("a"))), "Carotenoids", "Accessory pigment pool", expression(paste("Accessory pigment : chlorophyll-", italic("a"))), expression(paste("Antheraxanthin : chlorophyll-", italic("a"))), "D1 protein", "Violaxanthin", expression(paste("Violaxanthin : chlorophyll-", italic("a"))), "Zeaxanthin", expression(paste("Zeaxanthin : chlorophyll-", italic("a"))), expression(paste("Viola+Zeaxanthin : chlorophyll-", italic("a"))))
+
+#graph it 
+ggplot(data = graphdata, 
+       aes(x = factor(response_variable, level = rev(pigment.order)), 
+           y = mean, ymax = ci.ub, ymin = ci.lb,
+       #label = ifelse(Padj < 0.05, "*", "")
+       color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  #geom_text(vjust = 0.3, hjust = -0.5, size = 5) +
+  scale_color_manual(values = c('dodgerblue2', 'gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("Positive", "No effect", "Negative")) +
+  scale_x_discrete(labels = rev(pigment.labels)) +
+  coord_flip() + 
+  facet_grid(~ stressor, labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "Number of\ndata points") +
+  scale_y_continuous(breaks = seq(-4, 4, 2)) +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines")) 
+
+
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "pigments.jpg",
+       width = 25, height = 12, units = "cm")
+```
+Reproduction
+```{r}
+#have to skip step 6
+data6 <- data5
+#now run steps 7 - 10 like normal
+data10 <- filter(data9, Timepoint == "F")
+
+## Reproduction & Development
+my.repdev.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days),
+                                   #~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 Response_category == "Reproduction & Development"
+                               & Duration_days != "NA"),
+                               #& deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.repdev.oa)
+
+#create dataset to graph
+#create a data frame with all response variables
+repdev <- filter(data9, Response_category == "Reproduction & Development")
+
+resvarlist <- data.frame(response_variable = unique(repdev$Response_variable))
+
+#create a dataframe with the model output
+graphdata.repdev.oa <- data.frame(stressor = rep("OA", times = length(my.repdev.oa$ci.lb)),
+                  response_variable = my.repdev.oa$b[,0],
+                  mean = my.repdev.oa$b[, 1] * -1, 
+                  ci.lb = my.repdev.oa$ci.lb * -1,
+                  ci.ub = my.repdev.oa$ci.ub * -1,
+                  Padj = my.repdev.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.repdev.oa$response_variable <- rownames(graphdata.repdev.oa)
+#remove "factor(Response_variable)" from names
+graphdata.repdev.oa$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.repdev.oa$response_variable)
+
+#T
+my.repdev.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 Response_category == "Reproduction & Development"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.repdev.t)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.repdev.t <- data.frame( stressor = rep("T", times = length(my.repdev.t$ci.lb)),
+                  response_variable = my.repdev.t$b[,0],
+                  mean = my.repdev.t$b[, 1] * -1, 
+                  ci.lb = my.repdev.t$ci.lb *- 1,
+                  ci.ub = my.repdev.t$ci.ub * -1,
+                  Padj = my.repdev.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.repdev.t$response_variable <- rownames(graphdata.repdev.t)
+#remove "responsevariable" from names
+graphdata.repdev.t$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.repdev.t$response_variable)
+
+
+##OA + T
+my.repdev.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days),
+                                  # ~ 1 | deltapCO2,
+                                  # ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T" & 
+                                 Response_category == "Reproduction & Development"
+                               & Duration_days != "NA"),
+                               #& deltapCO2 != "NA"
+                               #& deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.repdev.oat)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.repdev.oat <- data.frame(stressor = rep("OA + T", 
+                                               times = length(my.repdev.oat$ci.lb)),
+                  response_variable = my.repdev.oat$b[,0],
+                  mean = my.repdev.oat$b[, 1] * -1, 
+                  ci.lb = my.repdev.oat$ci.lb * -1,
+                  ci.ub = my.repdev.oat$ci.ub * -1,
+                  Padj = my.repdev.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.repdev.oat$response_variable <- rownames(graphdata.repdev.oat)
+#remove "responsevariable" from names
+graphdata.repdev.oat$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              as.factor(graphdata.repdev.oat$response_variable))
+
+graphdata <-bind_rows(graphdata.repdev.oa, graphdata.repdev.oat, graphdata.repdev.t) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+#set point size equal to number of rows of data
+pointsize <- repdev %>%
+ count(Stressor, Response_variable) 
+countstudy <- repdev %>%
+  group_by(Stressor, Response_variable) %>%
+  summarize(count = n_distinct(Study))
+#add point size as a variable to the graphing data frame
+graphdata <- cbind(graphdata, pointsize = pointsize$n, studycount = countstudy$count) 
+
+#make a vector of labels for the y-axis
+repdevlabels <- data.frame(Sign_change = repdev$Sign_change, 
+                        Response_variable = repdev$Response_variable) %>%
+  arrange(Response_variable) %>%
+  distinct(Response_variable, .keep_all = TRUE) #The .keep_all function is used to retain all other variables in the output data frame.
+repdevlabels$labels <- with(repdevlabels, ifelse(repdevlabels$Sign_change == "-", 
+                    paste0("(-)", repdevlabels$Response_variable), 
+                    paste0(repdevlabels$Response_variable)))
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                          if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+repdevorder <- c("Germination rate", "Sex ratio", "Reproductive success", "Spore production", 
+                 "Oogonium formation",
+                 "Fertility", "Number of oogonia", "Frequency of females with vegetative growth", 
+                 "Reproductive area allocation", "Sorus induction", "Total fertile area", 
+                 "Half maximal reaction time", "Ungerminated spores", "Weight gain during sorus formation")
+repdevlabels <- c("Germination rate", "Sex ratio", "Reproductive success", "Spore production", 
+                  "Oogonium formation",
+                 "Fertility", "Number of oogonia", "(-)Frequency of females with vegetative growth", 
+                 "Reproductive area allocation", "Sorus induction", "Total fertile area", 
+                 "(-)Half maximal reaction time", "(-)Ungerminated spores", 
+                 "Weight gain during sorus formation")
+
+#graph it 
+ggplot(data = graphdata, 
+       aes(x = factor(response_variable, level = rev(repdevorder)),
+           y = mean, ymax = ci.ub, ymin = ci.lb, #label = ifelse(Padj < 0.05, "*", ""), 
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("No effect", "Negative")) +
+  #geom_text(vjust = -0.1, hjust = -0.4, size = 5) +
+  scale_x_discrete(labels = rev(repdevlabels)) +
+  coord_flip() + 
+  facet_grid(~ stressor, labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(#limits = c(1, 850), 
+    range = c(0.1, 1.5), name = "Number of\ndata points") +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines")) 
+
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "repdev.jpg",
+       width = 25, height = 10, units = "cm")
+```
+Respiration
+```{r}
+#have to skip step 6
+data6 <- data5
+#now run steps 7 - 10 like normal
+
+## Respiration
+my.resp <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days),
+                     subset = (Response_category == "Respiration" &
+                                 Duration_days != "NA"),
+                     mods = ~ Stressor - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.resp)
+
+resp <- subset(data9, Response_category == "Respiration")
+
+my.resp2 <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study/es_id, ~ 1 | deltaT/es_id),
+                     subset = (Response_category == "Respiration" & Stressor == "T"),
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+my.resp2
+#not sig
+
+
+graphdata.resp <- data.frame(stressor = c("OA", "OA + T", "T"),
+                  response_variable = rep("Respiration", times = 3),
+                  mean = my.resp$b[, 1] * -1, 
+                  ci.lb = my.resp$ci.lb * -1,
+                  ci.ub = my.resp$ci.ub * -1,
+                  Padj = my.resp$pval) 
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata.resp$col <- if_else(graphdata.resp$Padj > 0.05, 'grey',
+                      if_else(graphdata.resp$ci.ub < 0, 'red', 'blue'))
+
+pointsize <- resp %>%
+ count(Stressor) 
+countstudy <- resp %>%
+  group_by(Stressor) %>%
+  summarize(count = n_distinct(Study))
+
+#add point size as a variable to the graphing data frame
+graphdata.resp <- bind_cols(graphdata.resp, pointsize = pointsize$n, studycount = countstudy$count) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+ggplot(data = graphdata.resp, 
+       aes(x = response_variable, y = mean, ymax = ci.ub, ymin = ci.lb, 
+           #label = ifelse(Padj < 0.05, "*", ""), 
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("No effect", "Negative")) +
+  #geom_text(vjust = -0.1, hjust = -0.4, size = 5) +
+  coord_flip() + 
+  facet_grid(~ stressor, labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(#limits = c(1, 850), 
+    range = c(0.1, 1.5), name = "Number of\ndata points") +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines")) 
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "resp.jpg",
+       width = 18, height = 7, units = "cm")
+```
+Stress response
+```{r}
+#have to skip step 6
+data6 <- data5
+#now run steps 7 - 10 like normal
+data10 <- filter(data9, Timepoint != "NF")
+
+## Stress response
+my.strrsp.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 Response_category == "Stress response"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.strrsp.oa)
+
+#create dataset to graph
+#create a data frame with all response variables
+strrsp <- filter(data9, Response_category == "Stress response")
+
+resvarlist <- data.frame(response_variable = unique(strrsp$Response_variable))
+
+#create a dataframe with the model output
+graphdata.strrsp.oa <- data.frame(stressor = rep("OA", times = length(my.strrsp.oa$ci.lb)),
+                  response_variable = my.strrsp.oa$b[,0],
+                  mean = my.strrsp.oa$b[, 1] * -1, 
+                  ci.lb = my.strrsp.oa$ci.lb * -1,
+                  ci.ub = my.strrsp.oa$ci.ub * -1,
+                  Padj = my.strrsp.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.strrsp.oa$response_variable <- rownames(graphdata.strrsp.oa)
+#remove "factor(Response_variable)" from names
+graphdata.strrsp.oa$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.strrsp.oa$response_variable)
+
+#T
+my.strrsp.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 Response_category == "Stress response"
+                              & Duration_days != "NA"
+                              & deltaT != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.strrsp.t)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.strrsp.t <- data.frame( stressor = rep("T", times = length(my.strrsp.t$ci.lb)),
+                  response_variable = my.strrsp.t$b[,0],
+                  mean = my.strrsp.t$b[, 1] * -1, 
+                  ci.lb = my.strrsp.t$ci.lb *- 1,
+                  ci.ub = my.strrsp.t$ci.ub * -1,
+                  Padj = my.strrsp.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.strrsp.t$response_variable <- rownames(graphdata.strrsp.t)
+#remove "responsevariable" from names
+graphdata.strrsp.t$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.strrsp.t$response_variable)
+
+
+##OA + T
+my.strrsp.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA + T" & 
+                                 Response_category == "Stress response"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.strrsp.oat)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.strrsp.oat <- data.frame(stressor = rep("OA + T",  times = 1),
+                  response_variable = "Iodine accumulation",
+                  mean = my.strrsp.oat$b[, 1] * -1, 
+                  ci.lb = my.strrsp.oat$ci.lb * -1,
+                  ci.ub = my.strrsp.oat$ci.ub * -1,
+                  Padj = my.strrsp.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.strrsp.oat$response_variable <- rownames(graphdata.strrsp.oat)
+#remove "responsevariable" from names
+graphdata.strrsp.oat$response_variable <- "Iodine accumulation"
+
+graphdata <- bind_rows(graphdata.strrsp.oa, graphdata.strrsp.oat, graphdata.strrsp.t) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+#set point size equal to number of rows of data
+pointsize <- strrsp %>%
+ count(Stressor, Response_variable) 
+countstudy <- strrsp %>%
+  group_by(Stressor, Response_variable) %>%
+  summarize(count = n_distinct(Study))
+#add point size as a variable to the graphing data frame
+graphdata <- cbind(graphdata, pointsize = pointsize$n, studycount = countstudy$count)
+
+#make a vector of labels for the y-axis
+strrsplabels <- data.frame(Sign_change = strrsp$Sign_change, 
+                        Response_variable = strrsp$Response_variable) %>%
+  arrange(Response_variable) %>%
+  distinct(Response_variable, .keep_all = TRUE) #The .keep_all function is used to retain all other variables in the output data frame.
+strrsplabels$labels <- with(strrsplabels, ifelse(strrsplabels$Sign_change == "-", 
+                    paste0("(-)", strrsplabels$Response_variable), 
+                    paste0(strrsplabels$Response_variable)))
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+strrsp.order <- c("HSP70 expression","Malondialdehyde", "Iodine accumulation",
+                  "SOD activity", "Phlorotannin content", "CAT activity", 
+                  "Insoluble phlorotannin content", "Radical scavenging activity", 
+                  "Antioxidant pool size","Iodine efflux", "Flavonoid content", 
+                  "Phenolic content", "Antioxidant capacity", "Lipid peroxidation", 
+                  "Total phenolic content", "p-38-like protein phosphorylation", 
+                  "36 kDa band intensity", "42 kDa band intensity", "DMSP",
+                  "Hydrogen peroxide")
+strrsp.labels <- c("(-)HSP70 expression","(-)Malondialdehyde",
+                  "Iodine accumulation","(-)SOD activity", "Phlorotannin content",
+                  "(-)CAT activity", "(-)Insoluble phlorotannin content", 
+                  "(-)Radical scavenging activity", "Antioxidant pool size",
+                  "(-)Iodine efflux", "(-)Flavonoid content", "(-)Phenolic content",
+                  "(-)Antioxidant capacity", "(-)Lipid peroxidation", 
+                  "(-)Total phenolic content", "(-)p-38-like protein phosphorylation", 
+                  "(-)36 kDa band intensity", "(-)42 kDa band intensity", "(-)DMSP",
+                  "(-)Hydrogen peroxide")
+
+#graph it 
+theme_set(theme_bw(base_size=10))
+ggplot(data = graphdata, 
+       aes(x = factor(response_variable, level = rev(strrsp.order)), 
+           y = mean, ymax = ci.ub, ymin = ci.lb, #label = ifelse(Padj < 0.05, "*", "")
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('dodgerblue2','gray30', 'firebrick2','white'),
+                     name = "Effect",
+                     labels = c('Positive',"No effect", "Negative")) +
+  #geom_text(vjust = -0.1, hjust = -0.4, size = 5) +
+  coord_flip() + 
+  facet_grid(~ stressor, labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(#limits = c(1, 850), 
+    range = c(0.1, 1.5), name = "Number of\ndata points") +
+  scale_x_discrete(labels = rev(strrsp.labels)) +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines")) 
+
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "strrsp.jpg",
+       width = 23, height = 12, units = "cm")
+```
+Survival
+```{r}
+#have to skip step 6
+data6 <- data5
+#now run steps 7 - 10 like normal
+
+## Survival
+sur <- filter(data9, Response_category == "Survival")
+
+my.sur <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = ~ 1 | Study/es_id,
+                     subset = (Response_category == "Survival"),
+                     mods = ~ factor(Stressor) - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+my.sur
+
+graphdata.sur <- data.frame(stressor = c("OA", "OA + T", "T"),
+                  response_variable = rep("Survival", times = 3),
+                  mean = my.sur$b[, 1] * -1, 
+                  ci.lb = my.sur$ci.lb * -1,
+                  ci.ub = my.sur$ci.ub * -1,
+                  Padj = my.sur$pval) 
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata.sur$col <- if_else(graphdata.sur$Padj > 0.05, 'grey',
+                      if_else(graphdata.sur$ci.ub < 0, 'red', 'blue'))
+
+pointsize <- sur %>%
+ count(Stressor) 
+countstudy <- sur %>%
+  group_by(Stressor) %>%
+  summarize(count = n_distinct(Study))
+
+#add point size as a variable to the graphing data frame
+graphdata.sur <- bind_cols(graphdata.sur, pointsize = pointsize$n, studycount = countstudy$count) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+ggplot(data = graphdata.sur, 
+       aes(x = response_variable, y = mean, ymax = ci.ub, ymin = ci.lb, 
+           #label = ifelse(Padj < 0.05, "*", ""), 
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("No effect", "Negative")) +
+  #geom_text(vjust = -0.1, hjust = -0.4, size = 5) +
+  coord_flip() + 
+  facet_grid(~ stressor, labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(#limits = c(1, 850), 
+    range = c(0.1, 1.5), name = "Number of\ndata points") +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines")) 
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "survival.jpg",
+       width = 18, height = 7, units = "cm")
+```
+Tissue Health
+```{r}
+#have to skip step 6
+data6 <- data5
+#now run steps 7 - 10 like normal
+
+## Tissue health
+my.tishea.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" & 
+                                 Response_category == "Tissue health"
+                               & deltapCO2 != "NA"
+                               & Duration_days != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.tishea.oa)
+
+#create dataset to graph
+#create a data frame with all response variables
+tishea <- filter(data9, Response_category == "Tissue health")
+
+resvarlist <- data.frame(response_variable = unique(tishea$Response_variable))
+
+#create a dataframe with the model output
+graphdata.tishea.oa <- data.frame(stressor = rep("OA", times = length(my.tishea.oa$ci.lb)),
+                  response_variable = my.tishea.oa$b[,0],
+                  mean = my.tishea.oa$b[, 1] * -1, 
+                  ci.lb = my.tishea.oa$ci.lb * -1,
+                  ci.ub = my.tishea.oa$ci.ub * -1,
+                  Padj = my.tishea.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.tishea.oa$response_variable <- rownames(graphdata.tishea.oa)
+#remove "factor(Response_variable)" from names
+graphdata.tishea.oa$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.tishea.oa$response_variable)
+
+#T
+my.tishea.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" & 
+                                 Response_category == "Tissue health"
+                               & deltaT != "NA"
+                               & Duration_days != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.tishea.t)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.tishea.t <- data.frame( stressor = rep("T", times = length(my.tishea.t$ci.lb)),
+                  response_variable = my.tishea.t$b[,0],
+                  mean = my.tishea.t$b[, 1] * -1, 
+                  ci.lb = my.tishea.t$ci.lb *- 1,
+                  ci.ub = my.tishea.t$ci.ub * -1,
+                  Padj = my.tishea.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.tishea.t$response_variable <- rownames(graphdata.tishea.t)
+#remove "responsevariable" from names
+graphdata.tishea.t$response_variable <- gsub(paste(c("factor", "[(]", "[)]", "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.tishea.t$response_variable)
+
+##OA + T
+my.tishea.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days),
+                                   #~ 1 | deltaT,
+                                   #~ 1 | deltapCO2),
+                     subset = (Stressor == "OA + T" & 
+                                 Response_category == "Tissue health"
+                               #& deltaT != "NA"
+                               #& deltapCO2 != "NA"
+                               & Duration_days != "NA"),
+                     mods = ~ Response_variable - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(my.tishea.oat)
+
+#create dataset to graph
+#create a dataframe with the model output
+graphdata.tishea.oat <- data.frame(stressor = rep("OA + T",  times = length(my.tishea.oat$ci.lb)),
+                  response_variable = my.tishea.oat$b[,0],
+                  mean = my.tishea.oat$b[, 1] * -1, 
+                  ci.lb = my.tishea.oat$ci.lb * -1,
+                  ci.ub = my.tishea.oat$ci.ub * -1,
+                  Padj = my.tishea.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.tishea.oat$response_variable <- rownames(graphdata.tishea.oat)
+#remove "responsevariable" from names
+graphdata.tishea.oat$response_variable <- gsub(paste(c("factor", "[(]", "[)]", 
+                                                       "Response_variable"), 
+                                    collapse = "|"), "",
+                              graphdata.tishea.oat$response_variable)
+
+graphdata <- bind_rows(graphdata.tishea.oa, graphdata.tishea.oat, graphdata.tishea.t) %>%
+  mutate(stressor = fct_relevel(stressor, "T", "OA + T", "OA"))
+
+#set point size equal to number of rows of data
+pointsize <- tishea %>%
+ count(Stressor, Response_variable) 
+countstudy <- tishea %>%
+  group_by(Stressor, Response_variable) %>%
+  summarize(count = n_distinct(Study))
+#add point size as a variable to the graphing data frame
+graphdata <- cbind(graphdata, pointsize = pointsize$n, studycount = countstudy$count)
+
+#make a vector of labels for the y-axis
+tishealabels <- data.frame(Sign_change = tishea$Sign_change, 
+                        Response_variable = tishea$Response_variable) %>%
+  arrange(Response_variable) %>%
+  distinct(Response_variable, .keep_all = TRUE) #The .keep_all function is used to retain all other variables in the output data frame.
+tishealabels$labels <- with(tishealabels, ifelse(tishealabels$Sign_change == "-", 
+                    paste0("(-)", tishealabels$Response_variable), 
+                    paste0(tishealabels$Response_variable)))
+
+trmt.labs <- c("Acidification", "Acidification\nand Warming", "Warming")
+names(trmt.labs) <- c("OA", "OA + T", "T")
+
+#add in a column to indicate color of dots
+graphdata$col <- if_else(graphdata$Padj > 0.05, 'grey',
+                      if_else(graphdata$ci.ub < 0, 'red', 'blue'))
+
+tissue.order <- c("Tissue loss", "Maximum strain", "Breaking stress", "Fresh weight : Dry weight", 
+                  "Dry weight : Wet weight", "Number of blisters")
+tissue.labels <- c("(-)Tissue loss", "Maximum strain", "Breaking stress", "(-)Fresh weight : Dry weight", 
+                  "Dry weight : Wet weight", "(-)Number of blisters")
+
+#graph it 
+ggplot(data = graphdata, 
+       aes(x = factor(response_variable, level = rev(tissue.order)), 
+           y = mean, ymax = ci.ub, ymin = ci.lb, #label = ifelse(Padj < 0.05, "*", "")
+           color = col)) +
+  geom_hline(aes(yintercept = 0), lty = 3, size = 0.75, color = "grey80") +
+  geom_pointrange(aes(size = pointsize)) + 
+  scale_color_manual(values = c('dodgerblue2','gray30', 'firebrick2', 'white'),
+                     name = "Effect",
+                     labels = c("Positive","No effect", "Negative")) +
+  #geom_text(vjust = -0.1, hjust = -0.4, size = 5) +
+  coord_flip() + 
+  facet_grid(~ stressor, labeller = labeller(stressor = trmt.labs),
+             scales = "free_x", space = "free_x") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "Number of\ndata points") +
+  scale_x_discrete(labels = rev(tissue.labels)) +
+  xlab("Response variable") + ylab("Effect size") + 
+  theme_bw() +
+  theme(legend.position = "left",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background=element_rect(colour="white", fill="white"),
+        panel.border = element_blank(),
+        axis.line.y = element_line(),
+        axis.line.x = element_line(),
+        panel.spacing=unit(1, "lines")) 
+
+
+
+ggsave(path = "~/Documents/Github/Kelp-meta-analysis-project/Figures", 
+       plot = last_plot(), filename = "tissue.jpg",
+       width = 21, height = 9, units = "cm")
+```
+Taxa
+```{r}
+pointsize <- data9 %>%
+ count(Stressor, Family, Genus, Species) 
+data10 <- filter(data9, Timepoint != "NF")
+## create the model
+#species level
+rma.species.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" 
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Species - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.species.oa)
+
+#take model data and create a dataset
+graphdata.species.oa <- data.frame(
+  Type = rep("Species",  times = length(rma.species.oa$ci.lb)),
+  Stressor = rep("OA",  times = length(rma.species.oa$ci.lb)),
+                  mean = rma.species.oa$b[, 1] * -1, 
+                  ci.lb = rma.species.oa$ci.lb * -1,
+                  ci.ub = rma.species.oa$ci.ub * -1,
+                  Padj = rma.species.oa$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.species.oa$Species <- rownames(graphdata.species.oa)
+#remove "Species" from names
+graphdata.species.oa$Species <- gsub(paste("Species", 
+                                    collapse = "|"), "",
+                              graphdata.species.oa$Species)
+#now add in Family, Genus columns
+#generate family, species list (+ point size)
+oa.pointsize <- data9 %>%
+  subset(Stressor == "OA") %>%
+ count(Stressor, Family, Genus, Species) 
+#combine data frames
+graphdata.species.oa <- left_join(graphdata.species.oa, oa.pointsize, 
+                                  by = c("Species", "Stressor"))
+
+rma.species.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Species - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.species.oat)
+
+#take model data and create a dataset
+graphdata.species.oat <- data.frame(
+  Type = rep("Species",  times = length(rma.species.oat$ci.lb)),
+  Stressor = rep("OA + T",  times = length(rma.species.oat$ci.lb)),
+                  mean = rma.species.oat$b[, 1] * -1, 
+                  ci.lb = rma.species.oat$ci.lb * -1,
+                  ci.ub = rma.species.oat$ci.ub * -1,
+                  Padj = rma.species.oat$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.species.oat$Species <- rownames(graphdata.species.oat)
+#remove "Species" from names
+graphdata.species.oat$Species <- gsub(paste("Species", 
+                                    collapse = "|"), "",
+                              graphdata.species.oat$Species)
+#now add in Family, Genus columns
+#generate family, species list (+ point size)
+oat.pointsize <- data9 %>%
+  subset(Stressor == "OA + T") %>%
+ count(Stressor, Family, Genus, Species) 
+#combine data frames
+graphdata.species.oat <- left_join(graphdata.species.oat, oat.pointsize, 
+                                  by = c("Species", "Stressor"))
+
+
+rma.species.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Species - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.species.t)
+
+#take model data and create a dataset
+graphdata.species.t <- data.frame(
+  Type = rep("Species",  times = length(rma.species.t$ci.lb)),
+  Stressor = rep("T",  times = length(rma.species.t$ci.lb)),
+                  mean = rma.species.t$b[, 1] * -1, 
+                  ci.lb = rma.species.t$ci.lb * -1,
+                  ci.ub = rma.species.t$ci.ub * -1,
+                  Padj = rma.species.t$pval)
+#make R read the response_variable column as a column instead of row name
+graphdata.species.t$Species <- rownames(graphdata.species.t)
+#remove "Species" from names
+graphdata.species.t$Species <- gsub(paste("Species", 
+                                    collapse = "|"), "",
+                              graphdata.species.t$Species)
+#now add in Family, Genus columns
+#generate family, species list (+ point size)
+t.pointsize <- data9 %>%
+  subset(Stressor == "T") %>%
+ count(Stressor, Family, Genus, Species) 
+#combine data frames
+graphdata.species.t <- left_join(graphdata.species.t, t.pointsize, 
+                                  by = c("Species", "Stressor"))
+
+##################################
+#genus level
+rma.genus.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Genus - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.genus.oa)
+
+#take model data and create a dataset
+graphdata.genus.oa <- data.frame(
+  Type = rep("Genus",  times = length(rma.genus.oa$ci.lb)),
+  Stressor = rep("OA",  times = length(rma.genus.oa$ci.lb)),
+  mean = rma.genus.oa$b[, 1] * -1, 
+  ci.lb = rma.genus.oa$ci.lb * -1,
+  ci.ub = rma.genus.oa$ci.ub * -1,
+  Padj = rma.genus.oa$pval)
+#make R read the Genus column as a column instead of row name
+graphdata.genus.oa$Genus <- rownames(graphdata.genus.oa)
+#also assign to species column
+graphdata.genus.oa$Species <- rownames(graphdata.genus.oa)
+#remove "Genus" from names
+graphdata.genus.oa$Genus <- gsub(paste("Genus", 
+                                    collapse = "|"), "",
+                              graphdata.genus.oa$Genus)
+graphdata.genus.oa$Species <- gsub(paste("Genus", 
+                                    collapse = "|"), "",
+                              graphdata.genus.oa$Species)
+#now add in Family, Genus columns
+#generate family, species list (+ point size)
+oa.pointsize.g <- data9 %>%
+  subset(Stressor == "OA") %>%
+ count(Stressor, Family, Genus) 
+#combine data frames
+graphdata.genus.oa <- left_join(graphdata.genus.oa, oa.pointsize.g, 
+                                  by = c("Genus", "Stressor"))
+
+
+###
+rma.genus.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days),
+                                   #~ 1 | deltapCO2,
+                                   #~ 1 | deltaT),
+                     subset = (Stressor == "OA + T"
+                               & Duration_days != "NA"
+                              # & deltapCO2 != "NA"
+                              # & deltaT != "NA" 
+                              ),
+                     mods = ~ Genus - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.genus.oat)
+
+graphdata.genus.oat <- data.frame(
+  Type = rep("Genus",  times = length(rma.genus.oat$ci.lb)),
+  Stressor = rep("OA + T",  times = length(rma.genus.oat$ci.lb)),
+  mean = rma.genus.oat$b[, 1] * -1, 
+  ci.lb = rma.genus.oat$ci.lb * -1,
+  ci.ub = rma.genus.oat$ci.ub * -1,
+  Padj = rma.genus.oat$pval)
+#make R read the Genus column as a column instead of row name
+graphdata.genus.oat$Genus <- rownames(graphdata.genus.oat)
+#also assign to species column
+graphdata.genus.oat$Species <- rownames(graphdata.genus.oat)
+#remove "Genus" from names
+graphdata.genus.oat$Genus <- gsub(paste("Genus", 
+                                    collapse = "|"), "",
+                              graphdata.genus.oat$Genus)
+graphdata.genus.oat$Species <- gsub(paste("Genus", 
+                                    collapse = "|"), "",
+                              graphdata.genus.oat$Species)
+#now add in Family, Genus columns
+#generate family, species list (+ point size)
+oat.pointsize.g <- data9 %>%
+  subset(Stressor == "OA + T") %>%
+ count(Stressor, Family, Genus) 
+#combine data frames
+graphdata.genus.oat <- left_join(graphdata.genus.oat, oat.pointsize.g, 
+                                  by = c("Genus", "Stressor"))
+
+
+####
+rma.genus.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Genus - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.genus.t)
+
+graphdata.genus.t <- data.frame(
+  Type = rep("Genus",  times = length(rma.genus.t$ci.lb)),
+  Stressor = rep("T",  times = length(rma.genus.t$ci.lb)),
+  mean = rma.genus.t$b[, 1] * -1, 
+  ci.lb = rma.genus.t$ci.lb * -1,
+  ci.ub = rma.genus.t$ci.ub * -1,
+  Padj = rma.genus.t$pval)
+#make R read the Genus column as a column instead of row name
+graphdata.genus.t$Genus <- rownames(graphdata.genus.t)
+#also assign to species column
+graphdata.genus.t$Species <- rownames(graphdata.genus.t)
+#remove "Genus" from names
+graphdata.genus.t$Genus <- gsub(paste("Genus", 
+                                    collapse = "|"), "",
+                              graphdata.genus.t$Genus)
+graphdata.genus.t$Species <- gsub(paste("Genus", 
+                                    collapse = "|"), "",
+                              graphdata.genus.t$Species)
+#correct that error with Hedophyllum
+graphdata.genus.t$Genus <- gsub("Hedophyllum\n", "Hedophyllum", graphdata.genus.t$Genus)
+graphdata.genus.t$Species <- gsub("Hedophyllum\n", "Hedophyllum", graphdata.genus.t$Species)
+#now add in Family, Genus columns
+#generate family, species list (+ point size)
+t.pointsize.g <- data9 %>%
+  subset(Stressor == "T") %>%
+ count(Stressor, Family, Genus) 
+#combine data frames
+graphdata.genus.t <- left_join(graphdata.genus.t, t.pointsize.g, 
+                                  by = c("Genus", "Stressor"))
+
+#######################
+#family level
+rma.family.oa <- rma.mv(yi = yi, V = vi, data = data9, 
+                    random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Family - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.family.oa)
+
+graphdata.family.oa <- data.frame(
+  Type = rep("Family",  times = length(rma.family.oa$ci.lb)),
+  Stressor = rep("OA",  times = length(rma.family.oa$ci.lb)),
+  mean = rma.family.oa$b[, 1] * -1, 
+  ci.lb = rma.family.oa$ci.lb * -1,
+  ci.ub = rma.family.oa$ci.ub * -1,
+  Padj = rma.family.oa$pval)
+#make R read the Family column as a column instead of row name
+graphdata.family.oa$Family <- rownames(graphdata.family.oa)
+#remove "Genus" from names
+graphdata.family.oa$Family <- gsub(paste("Family", 
+                                    collapse = "|"), "",
+                              graphdata.family.oa$Family)
+#also assign to genus column
+graphdata.family.oa$Genus <- graphdata.family.oa$Family
+#also assign to species column
+graphdata.family.oa$Species <- graphdata.family.oa$Family
+#now add in point size
+#generate family, species list 
+oa.pointsize.f <- data9 %>%
+  subset(Stressor == "OA") %>%
+ count(Stressor, Family) 
+#combine data frames
+graphdata.family.oa <- left_join(graphdata.family.oa, oa.pointsize.f, 
+                                  by = c("Family", "Stressor"))
+
+
+########
+rma.family.oat <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T"
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Family - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.family.oat)
+
+graphdata.family.oat <- data.frame(
+  Type = rep("Family",  times = length(rma.family.oat$ci.lb)),
+  Stressor = rep("OA + T",  times = length(rma.family.oat$ci.lb)),
+  mean = rma.family.oat$b[, 1] * -1, 
+  ci.lb = rma.family.oat$ci.lb * -1,
+  ci.ub = rma.family.oat$ci.ub * -1,
+  Padj = rma.family.oat$pval)
+#make R read the Family column as a column instead of row name
+graphdata.family.oat$Family <- rownames(graphdata.family.oat)
+#remove "Genus" from names
+graphdata.family.oat$Family <- gsub(paste("Family", 
+                                    collapse = "|"), "",
+                              graphdata.family.oat$Family)
+#also assign to genus column
+graphdata.family.oat$Genus <- graphdata.family.oat$Family
+#also assign to species column
+graphdata.family.oat$Species <- graphdata.family.oat$Family
+#now add in point size
+#generate family, species list 
+oat.pointsize.f <- data9 %>%
+  subset(Stressor == "OA + T") %>%
+ count(Stressor, Family) 
+#combine data frames
+graphdata.family.oat <- left_join(graphdata.family.oat, oat.pointsize.f, 
+                                  by = c("Family", "Stressor"))
+
+
+###
+rma.family.t <- rma.mv(yi = yi, V = vi, data = data9, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T"
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Family - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.family.t)
+
+graphdata.family.t <- data.frame(
+  Type = rep("Family",  times = length(rma.family.t$ci.lb)),
+  Stressor = rep("T",  times = length(rma.family.t$ci.lb)),
+  mean = rma.family.t$b[, 1] * -1, 
+  ci.lb = rma.family.t$ci.lb * -1,
+  ci.ub = rma.family.t$ci.ub * -1,
+  Padj = rma.family.t$pval)
+#make R read the Family column as a column instead of row name
+graphdata.family.t$Family <- rownames(graphdata.family.t)
+#remove "Genus" from names
+graphdata.family.t$Family <- gsub(paste("Family", 
+                                    collapse = "|"), "",
+                              graphdata.family.t$Family)
+#also assign to genus column
+graphdata.family.t$Genus <- graphdata.family.t$Family
+#also assign to species column
+graphdata.family.t$Species <- graphdata.family.t$Family
+#now add in point size
+#generate family, species list 
+t.pointsize.f <- data9 %>%
+  subset(Stressor == "T") %>%
+ count(Stressor, Family) 
+#combine data frames
+graphdata.family.t <- left_join(graphdata.family.t, t.pointsize.f, 
+                                  by = c("Family", "Stressor"))
+```
+Male vs female gametophytes
+```{r}
+sexdata <- filter(data9, Specific.lifestage == "Gametophyte, male" 
+                  | Specific.lifestage == "Gametophyte, female")
+sexdata$Specific.lifestage <- as.factor(sexdata$Specific.lifestage)
+sexdata10 <- filter(sexdata, Timepoint != "NF")
+
+rma.sex.oa <- rma.mv(yi = yi, V = vi, data = sexdata, 
+                     random = list(~ 1 | Study,
+                                  # ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2),
+                     subset = (Stressor == "OA" 
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"),
+                     mods = ~ Specific.lifestage - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.sex.oa)
+
+
+rma.sex.oat <- rma.mv(yi = yi, V = vi, data = sexdata, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltapCO2,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "OA + T" 
+                               & Duration_days != "NA"
+                               & deltapCO2 != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Specific.lifestage - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+summary(rma.sex.oat)
+
+
+rma.sex.t <- rma.mv(yi = yi, V = vi, data = sexdata, 
+                     random = list(~ 1 | Study,
+                                   ~ 1 | Species,
+                                   ~ 1 | Duration_days,
+                                   ~ 1 | deltaT),
+                     subset = (Stressor == "T" 
+                               & Duration_days != "NA"
+                               & deltaT != "NA"),
+                     mods = ~ Specific.lifestage - 1, 
+                     method = "REML",
+                     control=list(optimizer = "optim", optmethod = "Nelder-Mead"),
+                     verbose = 2, #this will update you on the status on the model
+                     sparse = TRUE)
+
+summary(rma.sex.t)
+
+```
